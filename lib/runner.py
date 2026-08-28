@@ -41,7 +41,7 @@ _ROOT = os.path.dirname(_THIS)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from lib.judge import JudgeResult, judge_answer          # noqa: E402
+from lib.judge import JudgeResult, judge_answer, judge_failure_kinds  # noqa: E402
 from lib.providers import (                                # noqa: E402
     KNOWN_MODELS,
     BaseProvider,
@@ -80,14 +80,30 @@ def _make_provider(cfg: dict, dry_run: bool) -> BaseProvider:
 # --------------------------------------------------------------------------
 # 逐 run 缓存：让中途停掉/换题后能续跑，不浪费已跑完的 run
 #
-# 缓存键 = 被测模型 + task_id + run 序号 + (题面/参考答案/rubric/裁判) 指纹。
-# 题面或裁判一变，指纹就变、旧缓存自动失效，不会串味。
+# 缓存键 = 被测模型 + task_id + run 序号 +
+#          (题面/参考答案/rubric/N0/裁判/**Automated Checks 源码**/采样参数) 指纹。
+# 上述任一项变了指纹就变、旧缓存自动失效，不会串味。
+#
+# ⚠️ checks_src 必须进指纹：本项目的主要工作流就是反复收紧 grade() 判据，
+# 而缓存回吐的 run dict 里含 final_answer_score（run_once 落的 :198）。
+# 指纹不含判分源码时，「改完判据 --resume 重跑」会直接复用旧分，
+# 拿到的收紧效果是假的——这是最容易产生错误结论的一条。
+# 同理采样参数（temperature/max_tokens/stream）变了也必须重跑。
 # 只缓存「出了正文」的 run：空答复/重抽耗尽不落缓存，续跑时自然重试。
 # --------------------------------------------------------------------------
 CACHE_DIR = os.path.join(_ROOT, ".bench-cache")
 
 
-def _cache_fingerprint(task: Task, judge_model: Optional[str]) -> str:
+def _sampling_fingerprint(model: Optional[BaseProvider]) -> str:
+    """采样参数指纹：这些一变，答复分布就变，旧 run 不可复用。"""
+    if model is None:
+        return ""
+    return "|".join(str(getattr(model, k, None))
+                    for k in ("temperature", "max_tokens", "stream"))
+
+
+def _cache_fingerprint(task: Task, judge_model: Optional[str],
+                       sampling: str = "") -> str:
     h = hashlib.sha256()
     h.update((task.query or "").encode("utf-8"))
     h.update((task.reference or "").encode("utf-8"))
@@ -96,6 +112,8 @@ def _cache_fingerprint(task: Task, judge_model: Optional[str]) -> str:
              if rubric else b"")
     h.update(str(task.baseline_steps).encode("utf-8"))
     h.update((judge_model or "").encode("utf-8"))
+    h.update((task.checks_src or "").encode("utf-8"))
+    h.update(sampling.encode("utf-8"))
     return h.hexdigest()[:12]
 
 
@@ -106,8 +124,9 @@ def _cache_path(cache_dir: str, model_name: str, task: Task,
 
 
 def _load_cached_run(cache_dir: str, model_name: str, task: Task,
-                     run_idx: int, judge_model: Optional[str]) -> Optional[dict]:
-    fp = _cache_fingerprint(task, judge_model)
+                     run_idx: int, judge_model: Optional[str],
+                     sampling: str = "") -> Optional[dict]:
+    fp = _cache_fingerprint(task, judge_model, sampling)
     path = _cache_path(cache_dir, model_name, task, run_idx, fp)
     if not os.path.isfile(path):
         return None
@@ -119,8 +138,9 @@ def _load_cached_run(cache_dir: str, model_name: str, task: Task,
 
 
 def _save_cached_run(cache_dir: str, model_name: str, task: Task,
-                     run_idx: int, judge_model: Optional[str], run_dict: dict) -> None:
-    fp = _cache_fingerprint(task, judge_model)
+                     run_idx: int, judge_model: Optional[str], run_dict: dict,
+                     sampling: str = "") -> None:
+    fp = _cache_fingerprint(task, judge_model, sampling)
     os.makedirs(cache_dir, exist_ok=True)
     path = _cache_path(cache_dir, model_name, task, run_idx, fp)
     try:
@@ -189,6 +209,12 @@ def run_once(task: Task, model: BaseProvider, judge: Optional[BaseProvider],
             judge, reference=task.reference, steps=task.steps,
             rubric=task.rubric, answer=answer, baseline_steps=task.baseline_steps,
         )
+        # 裁判判不出来时旧实现是静默记 0（或静默截成满分），与「模型真答错」同形。
+        # 裁判占总分约 53%，这种静默是最贵的一种，必须与 grade() 异常一样喊出来。
+        kinds = judge_failure_kinds(jr.detail)
+        if kinds:
+            print(f"      ⚠ {task.task_id} 裁判判分失效（{'/'.join(kinds)}），"
+                  f"过程分记 0", flush=True)
     else:
         jr = JudgeResult(0.0, 0.0, task.baseline_steps, {"judge": "disabled"})
 
@@ -220,11 +246,13 @@ def run_task(task: Task, model: BaseProvider, judge: Optional[BaseProvider],
 
     judge_model = judge.model if judge else None
     cache_model = model_name or model.model
+    sampling = _sampling_fingerprint(model)
 
     def _one(i: int) -> dict:
         run_idx = i + 1
         if use_cache:
-            cached = _load_cached_run(cache_dir, cache_model, task, run_idx, judge_model)
+            cached = _load_cached_run(cache_dir, cache_model, task, run_idx, judge_model,
+                                      sampling)
             if cached is not None:
                 ans_len = len((cached.get("answer") or ""))
                 print(f"    · {task.task_id} run {run_idx}/{runs}  ♻ 命中缓存 {ans_len}字",
@@ -233,7 +261,8 @@ def run_task(task: Task, model: BaseProvider, judge: Optional[BaseProvider],
         d = run_once(task, model, judge, run_idx, workspace, runs_total=runs)
         # 只缓存出了正文的 run；空答复/重抽耗尽不落盘，续跑时重试
         if use_cache and (d.get("answer") or "").strip():
-            _save_cached_run(cache_dir, cache_model, task, run_idx, judge_model, d)
+            _save_cached_run(cache_dir, cache_model, task, run_idx, judge_model, d,
+                             sampling)
         return d
 
     if concurrency > 1:
@@ -320,6 +349,7 @@ def run_bench(config: dict, args) -> dict:
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     report["detailed"] = detailed
+    report["judge_health"] = _judge_health(detailed, judge is not None)
     return report
 
 
@@ -387,6 +417,36 @@ def _save(report: dict, out_dir: str) -> str:
     return path
 
 
+def _judge_health(detailed: List[dict], judge_enabled: bool) -> dict:
+    """
+    汇总裁判判分失效率。裁判掌握约 53% 的总权重（step+logic 占 S_i 的 2/3，
+    且 step_score 门控整个 20% 效率项），而四个扰动算子对它零覆盖——
+    失效率是唯一能在报告里看出「这批分数还算不算数」的指标，必须落库。
+    """
+    total = 0
+    failed = 0
+    by_kind: dict = {}
+    by_task: dict = {}
+    for d in detailed:
+        for run in d.get("runs") or []:
+            total += 1
+            kinds = judge_failure_kinds(run.get("judge_detail"))
+            if not kinds:
+                continue
+            failed += 1
+            by_task[d["task"]] = by_task.get(d["task"], 0) + 1
+            for k in kinds:
+                by_kind[k] = by_kind.get(k, 0) + 1
+    return {
+        "judge_enabled": judge_enabled,
+        "runs_total": total,
+        "runs_failed": failed,
+        "failure_rate": round(failed / total, 4) if total else 0.0,
+        "by_kind": by_kind,
+        "by_task": by_task,
+    }
+
+
 def _print_summary(report: dict) -> None:
     print("\n==================== 评测汇总 ====================")
     print(f"全 Bench 总分 S_total = {report['bench_total']}")
@@ -396,7 +456,23 @@ def _print_summary(report: dict) -> None:
     for t in report["tasks"]:
         print(f"    - {t['task_id']}: S_task={t['S_task']} "
               f"(成功{t['S_success']}/效率{t['S_eff']}/一致{t['S_consistency']})")
+    _print_judge_health(report.get("judge_health"))
     print("=================================================")
+
+
+def _print_judge_health(h: Optional[dict]) -> None:
+    """裁判失效率：0 也要打印，否则「没有告警」和「没有统计」分不清。"""
+    if not h or not h.get("judge_enabled"):
+        return
+    n, bad = h.get("runs_total", 0), h.get("runs_failed", 0)
+    if not bad:
+        print(f"  裁判判分：{n}/{n} 正常")
+        return
+    kinds = "，".join(f"{k}×{v}" for k, v in sorted(h.get("by_kind", {}).items()))
+    print(f"  ⚠ 裁判判分失效 {bad}/{n}（{h.get('failure_rate')}）：{kinds}")
+    for tid, c in sorted(h.get("by_task", {}).items(), key=lambda kv: -kv[1]):
+        print(f"      · {tid}: {c} run")
+    print("    ↑ 这些 run 的过程分与效率项被记 0，本批总分偏低、不可与正常批次横比。")
 
 
 def _print_leaderboard(rows: List[dict]) -> None:

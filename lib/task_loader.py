@@ -40,6 +40,7 @@ class Task:
     steps: List[str]
     rubric: str
     grade_fn: Optional[Callable]
+    checks_src: str = ""  # Automated Checks 的 python 源码原文，只用于缓存指纹（不参与判分）
 
     @property
     def baseline_steps(self) -> int:
@@ -370,7 +371,8 @@ def load_task(path: str) -> Task:
     rubric = _find_section(sections, "LLM Judge Rubric", "Judge Rubric")
     checks_body = _find_section(sections, "Automated Checks")
 
-    grade_fn = _compile_grade(_extract_python_block(checks_body), task_id)
+    checks_src = _extract_python_block(checks_body)
+    grade_fn = _compile_grade(checks_src, task_id)
 
     return Task(
         task_id=task_id,
@@ -381,6 +383,7 @@ def load_task(path: str) -> Task:
         steps=_extract_steps(steps_body),
         rubric=rubric,
         grade_fn=grade_fn,
+        checks_src=checks_src,
     )
 
 

@@ -76,6 +76,22 @@ def _clip01(x, default: float = 0.0) -> float:
     return max(0.0, min(1.0, v))
 
 
+# 裁判占总分约 53%（step+logic 占 S_i 的 2/3，且 step_score 门控整个 20% 效率项），
+# 而四个扰动算子完全不覆盖它。所以裁判侧的每一种「判不出来」都必须留痕、可计数，
+# 不能静默折算成一个看起来正常的分数。三种失效各自打标：
+#   parse_error   裁判输出里没有可解析的 JSON
+#   missing_keys  有 JSON 但缺 logic_score / step_score —— 否则与「真判 0 分」同形
+#   scale_error   分值 > 1.0（裁判换成百分制），旧实现会被 _clip01 静默截成满分 1.0
+JUDGE_FAILURE_FLAGS = ("parse_error", "missing_keys", "scale_error")
+
+
+def judge_failure_kinds(detail: Optional[dict]) -> List[str]:
+    """从落盘的 judge_detail 里取出失效标记，供 runner 汇总计数。"""
+    if not isinstance(detail, dict):
+        return []
+    return [k for k in JUDGE_FAILURE_FLAGS if detail.get(k)]
+
+
 class JudgeResult:
     def __init__(self, logic_score: float, step_score: float,
                  actual_steps: int, detail: dict):
@@ -104,13 +120,42 @@ def judge_answer(judge: BaseProvider, *, reference: str, steps: List[str],
             detail={"parse_error": True, "raw": result.text[:2000]},
         )
 
+    detail = dict(parsed)
+
+    # 缺 key 与「真判 0 分」必须可区分
+    missing = [k for k in ("logic_score", "step_score") if parsed.get(k) is None]
+    if missing:
+        detail["missing_keys"] = missing
+
+    # 标度错：0~1 之外的分值说明裁判不在本 rubric 的标度上。此时宁可记 0 并喊出来，
+    # 也不能像旧实现那样截成 1.0——静默给满分会把全库过程分拉满且事后无从区分。
+    raw_vals = [parsed.get("logic_score"), parsed.get("step_score")]
+    out_of_scale = []
+    for k, v in zip(("logic_score", "step_score"), raw_vals):
+        try:
+            if v is not None and float(v) > 1.0:
+                out_of_scale.append(k)
+        except (TypeError, ValueError):
+            continue
+    if out_of_scale:
+        detail["scale_error"] = out_of_scale
+        return JudgeResult(logic_score=0.0, step_score=0.0,
+                           actual_steps=baseline_steps, detail=detail)
+
     logic = _clip01(parsed.get("logic_score"))
     step = _clip01(parsed.get("step_score"))
-    try:
-        actual = int(parsed.get("actual_steps") or baseline_steps)
-    except (TypeError, ValueError):
+
+    # `or baseline_steps` 会把裁判明确给出的 actual_steps=0 吞成「与参考解一样多」，
+    # 让 scoring-rules 第六节对 N=0 的规定永不触发。这里只在「缺字段」时回退。
+    raw_steps = parsed.get("actual_steps")
+    if raw_steps is None:
         actual = baseline_steps
+    else:
+        try:
+            actual = int(raw_steps)
+        except (TypeError, ValueError):
+            actual = baseline_steps
     actual = max(actual, 0)
 
     return JudgeResult(logic_score=logic, step_score=step, actual_steps=actual,
-                       detail=parsed)
+                       detail=detail)
