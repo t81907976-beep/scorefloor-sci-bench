@@ -1,0 +1,7 @@
+# ScoreFloor-Sci-Bench 运行依赖
+#
+# 核心链路（providers / task_loader / judge / runner / scoring）仅用 Python 标准库，
+# 无需安装任何第三方包，Python 3.8+ 即可 `./scripts/run.sh --dry-run`。
+#
+# 下面为可选增强，按需取消注释：
+# requests>=2.31.0      # 若想用 requests 替代内置 urllib（当前实现无需）
