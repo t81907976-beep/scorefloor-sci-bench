@@ -125,6 +125,13 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
             "×": "x", "·": "*", "，": ","
         })
         s = s.translate(table)
+        # LaTeX 关系符与细空格必须先归一：答复普遍写
+        # `\alpha=\sqrt{|E|/[\hbar^2/(2m^*L^2)]}\approx 0.5811`，
+        # 不把 `\approx` 折成 `≈`，compact 后就成了 `approx0.5811`，
+        # numbers() 的 `(?<![\w.])` 前查被字母 x 挡住、整个数值取不到，
+        # 派生量判据（α、ν）因此 5/5 集体假阴性。
+        s = re.sub(r"(?i)\\(?:approx|approxeq|simeq|cong|doteq)", "≈", s)
+        s = re.sub(r"\\[,;:!>]|\\q?quad", " ", s)
         s = re.sub(
             r"(?i)([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?:x|\*)\s*10\s*\^?\s*([-+]?\d+)",
             r"\1e\2",
@@ -147,19 +154,20 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
             return abs(value) <= rel
         return abs(value - target) / abs(target) <= rel
 
-    def has_labeled_value(s, label_pattern, target, rel=0.03):
-        ns = normalize(s)
-        pattern = (
-            r"(?i)(?:" + label_pattern + r")"
-            r"\s*(?:=|≈|~|≃|:|为|约为|约)?\s*"
-            r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
-        )
-        for match in re.finditer(pattern, ns):
-            try:
-                if close(float(match.group(1)), target, rel):
+    def has_labeled_value_near(label_pattern, target, rel=0.03, win=70):
+        """在 compact（去空白）文本上判「符号标签之后的邻域里出现该目标值」。
+
+        原 has_labeled_value 要求「标签 (=|≈) 数值」紧邻，已删（无调用点）：答复
+        普遍先写定义式再落数值 —— `\\alpha=\\sqrt{|E|/[\\hbar^2/(2m^*L^2)]}≈0.5811`、
+        `q=L\\sqrt{-2m^*E}/\\hbar≈0.58107`、`s=(-1+\\sqrt{1+4(...)})/2≈0.76513`，
+        标签与数值之间隔着整条公式，5/5 答复集体判 0（假阴性）。
+        判据要看的是「这个无量纲参数算对没有」，故改为标签后 win 字符内找目标值；
+        判别力仍全部落在 3% 数值窗上，算错的答复照样进不来。
+        """
+        for match in re.finditer(label_pattern, compact, re.I):
+            for value in numbers(compact[match.end():match.end() + win]):
+                if close(value, target, rel):
                     return True
-            except Exception:
-                pass
         return False
 
     def has_robin_length(s):
@@ -196,34 +204,53 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     text = get_final_assistant_text(transcript)
     norm = normalize(text)
     low = norm.lower()
+    # compact 提到前面来：数值锚判据都要在去空白文本上比对，
+    # 否则显示公式里的换行会把「标签 → 数值」的邻域切断。
+    compact = re.sub(r"\s+", "", norm)
 
+    # non_empty_answer / not_refusal 的权重已归零（白拿项①）：空答与拒答由 runner
+    # 层记 0，在 grade() 里再给一遍就是与题目无关的白拿。两键保留只作诊断输出。
     non_empty_answer = 1.0 if len(re.sub(r"\s+", "", text)) >= 30 else 0.0
     not_refusal = 1.0 if text.strip() and not is_refusal(text) else 0.0
 
-    # 两个无量纲参数的符号各家不同：衰减指数写 α / β / η / κ，势阱强度参数写 ν / s。
-    # 只认 SFT 用的 α、ν 会把「记号不同」记成「算错」（5 次答复集体假阴性）。
+    # 两个无量纲参数的符号各家不同：衰减指数写 α / β / η / κ / ρ / μ / q，
+    # 势阱强度参数写 ν / s。只认 SFT 用的 α、ν 会把「记号不同」记成「算错」。
+    # 单字母标签要挡掉 LaTeX 命令内部的字母（`\sqrt` 里的 q、s；`\ast` 里的 s），
+    # 否则邻域判据会从公式骨架里起跳。
+    DECAY_LABEL = (r"(?:α|β|η|κ|ρ|μ|\\?(?:alpha|beta|eta|kappa|rho|mu)"
+                   r"|(?<![A-Za-z\\])q(?![A-Za-z]))")
+    WELL_LABEL = r"(?:ν|\\?nu|(?<![A-Za-z\\])s(?![A-Za-z]))"
     # 同时接受平方形式（α²=0.33764、ν(ν+1)=1.35056），那是只有换算正确才写得出的派生量。
     decay_exponent_ok = (
-        has_labeled_value(norm, r"α|alpha|β|beta|η|eta|κ|kappa", 0.58107, 0.03)
-        or has_labeled_value(
-            norm, r"(?:α|alpha|β|beta|η|eta|κ|kappa)\s*\^?\s*2", 0.337640, 0.03)
+        has_labeled_value_near(DECAY_LABEL, 0.58107, 0.03)
+        or has_labeled_value_near(DECAY_LABEL, 0.337640, 0.03)
     )
     well_strength_ok = (
-        has_labeled_value(norm, r"ν|nu|(?<![a-z])s(?![a-z])", 0.76513, 0.03)
-        or has_labeled_value(
-            norm, r"(?:ν|nu|s)\s*\(\s*(?:ν|nu|s)\s*\+\s*1\s*\)", 1.35056, 0.03)
+        has_labeled_value_near(WELL_LABEL, 0.76513, 0.03)
+        or has_labeled_value_near(WELL_LABEL, 1.35056, 0.03)
     )
     dimensionless_parameters = 1.0 if decay_exponent_ok and well_strength_ok else 0.0
 
     robin_length_nm = 1.0 if has_robin_length(norm) else 0.0
 
+    # ⚠️ 以下三项原本是**纯关键词判据**，数值全错也一字不动地满分（实测
+    # ordinary_kummer 5/5、noninteger 5/5、decaying 3/5 白拿）。而且它们的判据词
+    # 本身就在题面里：题面把「普通 Kummer 连接公式 vs 整数差退化的对数型连接公式」
+    # 连正确答案一起枚举，并直接写明「不得把 x=0 偶奇局部解当全局解」——
+    # 复述题面即命中，属于题面喂饱的白拿。
+    # 因此统一挂上派生数值锚 decay_exponent_ok（α=κL=0.58107，或等价的 α²=0.33764）：
+    # 远端两分支的指数差就是 ±α、衰减支就是 e^{-αx/L}，α 既是「非整数 ⇒ 用普通
+    # Kummer」这个结论的判据本身，也是「保留衰减支」的衰减率；它只能由 E、U0、L、m*
+    # 换算后解出，题面没给。数值扰动把 α 打掉后这三项一并归零。
     has_kummer = "kummer" in low
     has_ordinary = (
         re.search(r"普通.{0,16}kummer|kummer.{0,16}普通", low) is not None
         or re.search(r"ordinary.{0,16}kummer|standard.{0,16}kummer", low) is not None
         or re.search(r"非退化.{0,16}kummer|non[- ]?degenerate.{0,16}kummer", low) is not None
     )
-    ordinary_kummer_selected = 1.0 if has_kummer and has_ordinary else 0.0
+    ordinary_kummer_selected = 1.0 if (
+        has_kummer and has_ordinary and decay_exponent_ok
+    ) else 0.0
 
     noninteger = (
         "非整数" in norm or "不是整数" in norm or "不为整数" in norm
@@ -241,7 +268,11 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         or re.search(r"(?i)(?:not|rather than|instead of|no)[^\n]{0,25}"
                      r"(?:logarithmic|degenerate|log terms?)", norm) is not None
     )
-    noninteger_and_no_log = 1.0 if noninteger and rejects_log else 0.0
+    # 同挂 α 数值锚：「指数差非整数」这句话的全部内容就是 ±α=±0.58107 不是整数，
+    # 没算出 α 而只写「不是整数」的，是在复述题面第 12 行的选项枚举。
+    noninteger_and_no_log = 1.0 if (
+        noninteger and rejects_log and decay_exponent_ok
+    ) else 0.0
 
     has_decay = (
         "衰减" in norm or "指数下降" in norm
@@ -251,8 +282,8 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     # （`唯一衰减(recessive)解`、`只有 Ferrers 函数给出 →0`、`必须衰减故只保留…`），
     # 而不是反面声明「舍弃增长支」。只认反面模板会让 5 次全对的答复集体判 0。
     # 判据改为：出现「唯一/只有/只保留/必须取…」这类筛选语，且其邻域谈的是
-    # 衰减/有界/局域（compact 上比对，避免公式里的空白与换行切断邻域）。
-    compact = re.sub(r"\s+", "", norm)
+    # 衰减/有界/局域（compact 上比对，避免公式里的空白与换行切断邻域；
+    # compact 已在上文统一定义）。
     selection_words = (r"(?:唯一|只有|只能保留|只保留|仅保留|必须(?:取|选|保留|衰减)"
                        r"|舍弃|排除|不含|去掉|不能含|不得含|含增长)")
     physical_words = (r"(?:衰减|有界|→0|->0|recessive|指数下降|局域|束缚模|物理解"
@@ -272,18 +303,22 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     keeps_growth = re.search(
         r"(?:保留|取|采用|选(?:取|用)?)\s*(?:了)?\s*(?:e\^?\{?\+|增长支|增长解|发散支|发散解)",
         compact) is not None
+    # 同挂 α 数值锚：衰减支的衰减率就是 α（ψ∝e^{-αx/L}），题面第 14 行已经把
+    # 「不得把 x=0 偶奇局部解当全局解」这条防御逻辑写进去了，只认文字等于白送。
     decaying_global_branch = 1.0 if (
-        has_decay and rejects_growth and not keeps_growth
+        has_decay and rejects_growth and not keeps_growth and decay_exponent_ok
     ) else 0.0
 
+    # 权重按白拿口径重分配：归零 non_empty_answer + not_refusal 共 0.10，
+    # 其余各项按 旧权重/(1-0.10) 等比放大（和仍为 1.000，完全正确的答复照拿 1.0）。
     weights = {
-        "non_empty_answer": 0.05,
-        "not_refusal": 0.05,
-        "dimensionless_parameters": 0.10,
-        "robin_length_nm": 0.35,
-        "ordinary_kummer_selected": 0.20,
-        "noninteger_and_no_log": 0.10,
-        "decaying_global_branch": 0.15
+        "non_empty_answer": 0.0,
+        "not_refusal": 0.0,
+        "dimensionless_parameters": 0.111111,
+        "robin_length_nm": 0.388889,
+        "ordinary_kummer_selected": 0.222222,
+        "noninteger_and_no_log": 0.111111,
+        "decaying_global_branch": 0.166667
     }
 
     checks = {

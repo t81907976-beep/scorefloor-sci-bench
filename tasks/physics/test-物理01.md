@@ -157,25 +157,56 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     gc_usable = bool(re.search(r'(导引中心|导心|guiding[\s-]?center)[^\n。；;]{0,30}(可用|成立|适用|满足|有效)', full_l))
     qn_usable = bool(re.search(r'(准中性|quasi[\s-]?neutral)[^\n。；;]{0,30}(可用|成立|适用|满足|有效)', full_l))
     both_usable = gc_usable and qn_usable
-    rho_ok = ("8.1" in full or "8.2" in full or "8.17" in full) or bool(re.search(r'ρ\s*_?\s*i', full_l)) \
-             or ("回旋半径" in full)
-    lde_ok = ("14.9" in full or "1.49" in full or "15 μm" in full_l or "15μm" in full_l) \
-             or ("德拜" in full) or ("λde" in full_l) or ("λ_de" in full_l)
+    # 「量级判据」加数值同现闸门（按化学题白拿口径收紧）。
+    # 原判据是纯关键词：全文出现「回旋半径」「德拜」二字、或 ρi / λDe 符号就算命中，
+    # 与算得对不对无关 —— 数值全错的答复照样白拿这一项（扰动算子实测 5/5 命中）。
+    # 现在要求「符号或关键词 + 该量的真值」落在同一邻接窗内（正反两序都认）。
+    # 数值锚取标准答案的派生量：ρi=8.17×10⁻³ m（=0.817 cm）、ρe=2.34×10⁻⁴ m（=0.234 mm）、
+    # λDe=1.49×10⁻⁵ m（=14.9 μm）—— 都得自己算 √(2mkT)/(eB) 与 √(ε0kTe/(ne²)) 才写得出。
+    # ρ 支 i/e 二选一：单锚会误杀（回归样本 run4 把 ρi 算成 1.29 cm，但 ρe=2.33×10⁻⁴ 是对的）。
+    # 「15 μm」一支已删：整数写法，只扰小数的探针碰不到它，留着等于留个免疫缺口。
+    _WIN = r'[^\n]{0,40}'
+    _RHO_LBL = r'(?:(?:ρ|\\rho)\s*_?\s*\{?\s*[ie]|回旋半径|拉莫尔半径|larmor|gyro[\s-]?radius)'
+    _RHO_NUM = r'(?:8\.1\d?|8\.2(?!\d)|0\.81\d?|2\.3[34]\d?|0\.23[34]?)'
+    _LDE_LBL = r'(?:德拜|debye|(?:λ|\\lambda)\s*_?\s*\{?\s*d)'
+    _LDE_NUM = r'(?:1\.49\d?|14\.9\d?)'
+
+    def _cooccur(lbl, num):
+        return bool(re.search(lbl + _WIN + num, full_l)
+                    or re.search(num + _WIN + lbl, full_l))
+
+    rho_ok = _cooccur(_RHO_LBL, _RHO_NUM)
+    lde_ok = _cooccur(_LDE_LBL, _LDE_NUM)
     approx_quant = rho_ok and lde_ok
 
+    # ── 以下三项按化学题的白拿口径归零权重，只留作诊断项输出 ──────────────
+    # 白拿①：non_empty_answer / not_refusal —— 空答与拒答由 runner 层记 0，
+    #   在 grade() 里再给一遍就是与题目无关的白拿。
+    # 白拿②③：has_unit —— 「全文任何位置出现 A/m² 或 m/s」和答案对错无关，
+    #   单位是否配得上结论已经并进 dey_hit / vpi_hit 的「符号=数值」抽取里判。
+    # 三个键都保留（回归 fixture 与审计脚本按键逐项对照），只是权重为 0。
     non_empty = 1.0 if len(full.strip()) >= 30 else 0.0
     refusal = bool(re.search(r"(无法回答|不能回答|不会做|拒绝作答|i cannot|i can't|cannot solve)", full_l))
     not_refusal = 0.0 if refusal else 1.0
-
-    core = 0.25 * (1.0 if dey_hit else 0.0) \
-         + 0.25 * (1.0 if (vpi_hit and not vpe_wrong_order) else 0.0)
     has_unit = 1.0 if re.search(
         r"(v\s*[·⋅]?\s*m\s*\^?\{?\s*-?\s*1\s*\}?\s*[·⋅]?\s*s|v/\(?m\s*[·⋅]?\s*s\)?|"
         r"v\s*m⁻¹\s*s⁻¹|a\s*/\s*m\s*\^?\{?\s*2|a\s*m\s*\^?\{?\s*-?\s*2|a/m²|m\s*/\s*s|m\s*s\s*\^?\{?\s*-?\s*1)",
         full_l) else 0.0
-    approx_final = 0.15 if (both_usable and approx_quant) else (0.075 if both_usable else 0.0)
 
-    final_answer = 0.10 * non_empty + 0.10 * not_refusal + core + 0.15 * has_unit + approx_final
+    # 归零的三项原权重合计 0.10+0.10+0.15=0.35，按比例重分配给剩下的实质项：
+    #   新权重 = 旧权重/(1-0.35) —— dey/vpi 各 0.25→5/13≈0.3846、近似判定 0.15→3/13≈0.2308。
+    # 三项全中仍是 5/13+5/13+3/13=1.000，完全正确的答复分数不降。
+    W_DEY = W_VPI = 0.25 / 0.65
+    W_APPROX = 0.15 / 0.65
+
+    core = W_DEY * (1.0 if dey_hit else 0.0) \
+         + W_VPI * (1.0 if (vpi_hit and not vpe_wrong_order) else 0.0)
+    # 原来「只判可用/可用、给不出量级判据」还有半档 0.075。那半档是纯关键词，
+    # 且题面结论行已把「可用/不可用」两个选项连同措辞一起列给模型（第 15 行），
+    # 复述题面就能拿 —— 按白拿口径取消半档，量级判据不达标即 0。
+    approx_final = W_APPROX if (both_usable and approx_quant) else 0.0
+
+    final_answer = core + approx_final
     out["non_empty_answer"] = non_empty
     out["not_refusal"] = not_refusal
     out["dey_hit"] = 1.0 if dey_hit else 0.0
@@ -186,7 +217,7 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     anchors = [dey_hit, jp_hit, vpi_hit, vpe_hit and not vpe_wrong_order]
     out["numeric_anchor_hit_rate"] = round(sum(1 for h in anchors if h) / 4.0, 4)
 
-    out["auto_final_answer_score"] = round(final_answer, 4)
+    out["auto_final_answer_score"] = round(min(1.0, final_answer), 4)
     return out
 ```
 

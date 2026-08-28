@@ -88,72 +88,144 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         anchor_region = final_msg.split(ANSWER_TAG, 1)[1][:400]
     region_l = anchor_region.lower()
 
-    def _nums(pattern, text):
+    _NUM = (r'(?<![\d.])([0-9]*\.?[0-9]+)\s*'
+            r'(?:[×x*]\s*10\s*\^?\{?\s*([-+]?\d+)\s*\}?|e\s*([-+]?\d+))?')
+
+    def _nums(pattern, text, window=40):
+        """收集标签后邻接窗内的**全部**数值，连带每个数前后的上下文串。
+
+        返回 (值, 数后 20 字符, 标签与数之间的间隔串)。后两项供单位与「同一条赋值链」判定。
+
+        旧实现每个标签只取窗内第一个数，这是假阴性来源：`τ_a = 1/Γ = 33.3 s` 里
+        第一个数是 `1/Γ` 的 `1`，真正的结论 33.3 被顶掉 —— 本题自己的 SFT 标准答案
+        因此只拿半分。同一个坑物理03 的 `extract_plain/extract_scientific` 已经修过。
+        """
         vals = []
         for m in re.finditer(pattern, text, flags=re.IGNORECASE):
-            seg = text[m.end():m.end() + 40]
-            sm = re.search(
-                r'([0-9]*\.?[0-9]+)\s*(?:[×x*]\s*10\s*\^?\{?\s*([-+]?\d+)\s*\}?|e\s*([-+]?\d+))?',
-                seg, flags=re.IGNORECASE)
-            if sm and sm.group(1):
+            seg = text[m.end():m.end() + window]
+            for sm in re.finditer(_NUM, seg, flags=re.IGNORECASE):
                 v = float(sm.group(1))
                 exp = sm.group(2) or sm.group(3)
                 if exp:
                     v *= 10 ** int(exp)
-                vals.append(v)
+                vals.append((v, seg[sm.end():sm.end() + 20], seg[:sm.start()]))
         return vals
 
     def _relerr(v, target):
         return abs(v - target) / abs(target) if (v is not None and target != 0) else None
 
+    def _hit(vals, target, tol):
+        return any(_relerr(v, target) <= tol for v, _tail, _gap in vals)
+
     out = {}
 
     # ---- τ_a 量级台阶（目标 33.3 s）----
-    tau_vals = _nums(r'(?:τ\s*_?\s*a|tau_?a|a\s*态?\s*寿命|寿命)\s*[:=≈约]?', full)
-    tau_errs = [e for e in (_relerr(v, 33.3) for v in tau_vals) if e is not None]
-    tau_min = min(tau_errs) if tau_errs else None
-    if tau_min is not None and tau_min <= 0.15:
-        tau_step = 0.30
-    elif tau_min is not None and tau_min <= 1.0:
-        tau_step = 0.15
+    # 按白拿口径收紧两处：
+    # ①τ 值必须紧跟**秒量纲**。裸数会把 `τ_a=1/Γ` 的 `1` 和 `Γ=3.00×10⁻²` 一起收进来，
+    #   而 `1` 是整数、任何数值扰动都动不到它，它对 33.3 的相对差 0.97 恰好落在旧半分带内
+    #   → 每份答复白拿 0.15（判的是「写了个数」不是「算对了」）。
+    # ②半分带由「相对差 ≤1.0」改成「倍数落在 0.5~1.5 之间」。相对差 ≤1.0 对任何小于
+    #   2×33.3 的正数都成立（是条半直线，向下无界），×0.31/×0.19/×0.077 的扰动全落在
+    #   里面、结构上压不掉；按倍数两侧算才是「量级对」的本意（49.8 s=1.50× 仍在带内）。
+    # ③τ 值必须与 τ 标签处在**同一条赋值链**上：标签与数之间不许出现中文或全角标点。
+    #   `τ_a=…=66.66 s . 对于 t=30 s ：` 里的 `t=30 s` 也带秒量纲、30/33.3=0.90 正落在
+    #   满档带内，窗口一长就整份白拿满档（run4 实测）。题面给的 B(10/30/80 s) 三个时间点
+    #   都是整数、数值扰动动不到，必须靠「跨句就不算」把它们挡在窗外。
+    _SEC = re.compile(r'^[\\\s,;:!>{]{0,12}(?:mathrm|text|rm)?[\s{]{0,4}(?:s|秒)'
+                      r'(?![\w^⁻]|\s*\^|\s*-\s*1)')
+    _BREAK = re.compile(r'[一-鿿　-〿＀-￯]')  # 中文与全角标点
+    tau_vals = [v for v, tail, gap in _nums(
+        r'(?:τ\s*_?\s*a|tau_?a|a\s*态?\s*寿命|寿命)\s*[:=≈约]?', full, 80)
+        if _SEC.match(tail) and not _BREAK.search(gap)]
+    tau_ratio = [v / 33.3 for v in tau_vals if v > 0]
+    if any(abs(r - 1.0) <= 0.15 for r in tau_ratio):
+        tau_frac = 1.0
+    elif any(0.5 <= r <= 1.5 for r in tau_ratio):
+        tau_frac = 0.5
     else:
-        tau_step = 0.0
+        tau_frac = 0.0
 
     # ---- 主支归属量级台阶 ----
-    says_ag_dominant = bool(re.search(
-        r'(a\s*[→\-]+\s*g|a→g)[^\n]{0,40}(90(\.0)?\s*%|0\.90|主支|主要?分支|dominant)', full_l))
-    says_swapped = bool(re.search(
-        r'(a\s*[→\-]+\s*b|a→b)[^\n]{0,40}(8[0-9](\.\d)?\s*%|0\.8[0-9]|主支|dominant)', full_l)) \
-        or bool(re.search(r'(a\s*[→\-]+\s*g|a→g)[^\n]{0,40}(1[0-9](\.\d)?\s*%|0\.1[0-9])', full_l))
-    ag_direction = bool(re.search(
-        r'(a\s*[→\-]+\s*g|a→g)[^\n]{0,40}(主支|主要|较大|更大|larger|dominant|[5-9][0-9](\.\d)?\s*%)', full_l))
+    # 收紧两处：
+    # ①分支窗不许跨 `；`/`、`/`，` 等分隔符。旧窗从 a→g 起算 40 字符，长到能吃进后面
+    #   a→b 的 10.0%，把题面格式行（`A(a→g)=…（Br…）；A(a→b)=…（Br…）`）诱导出来的
+    #   **正确**写法误判成「主支搞反」—— 本题自己的 SFT 标准答案实测只拿 0.65 就是它。
+    # ②两级台阶都要求数值同现。旧版 `主支|主要|较大|dominant` 是纯关键词支，数值全错时
+    #   一字不动就给分；主支归属是本题核心防御位，只认结论词等于没判。
+    # ③裸小数支必须先挂上 `Br`/分支比 标签。`0.5~0.9` 这个区间在本题里同时是「多数分支」
+    #   和「被扰动过的部分速率」：run5 的 `A(a→g)=2.70×10⁻²` 在含整数档被扰成
+    #   `A(a→g)=0.513`，无标签的裸小数支直接把它当成「a→g 占多数」给了半档。
+    #   百分号支不需要这层保护（`%` 自带分支比语义）。
+    _S = r'[^\n；;、，,]'
+    AG = r'(?:a\s*[→\-]+\s*g|a→g)'
+    AB = r'(?:a\s*[→\-]+\s*b|a→b)'
+    _BR = r'(?:br|分支比|分支|branching)' + _S + r'{0,12}?'
+    MAJ = (r'(?:(?<![\d.])90(?:\.\d+)?\s*\\?%'
+           r'|' + _BR + r'(?<![\d.])0\.9(?:0\d*)?(?![\d]))')
+    MIN = (r'(?:(?<![\d.])10(?:\.\d+)?\s*\\?%'
+           r'|' + _BR + r'(?<![\d.])0\.1(?:0\d*)?(?![\d]))')
+    MOST = (r'(?:(?<![\d.])[5-9][0-9](?:\.\d+)?\s*\\?%'
+            r'|' + _BR + r'(?<![\d.])0\.[5-9]\d*(?![\d]))')
+
+    def _win(label, pat, span=40):
+        return bool(re.search(label + _S + r'{0,%d}?' % span + pat, full_l))
+
+    says_ag_dominant = _win(AG, MAJ)
+    says_swapped = (_win(AB, MAJ) or _win(AG, MIN)
+                    or _win(AB, r'(?:主支|主要分支|dominant)', 24))
+    ag_direction = _win(AG, MOST)
     if says_ag_dominant and not says_swapped:
-        branch_step = 0.20
+        branch_frac = 1.0
     elif ag_direction and not says_swapped:
-        branch_step = 0.10
+        branch_frac = 0.5
     else:
-        branch_step = 0.0
+        branch_frac = 0.0
 
     # ---- 诱导 E1 量级台阶 ----
+    # 收紧三处：
+    # ①删掉 `or ("5.1" in full)` 与 `"10^-6"/"10⁻⁶"/"e-6" in full` 这几支裸子串锚 ——
+    #   答复里任何位置出现 "5.1" 或任何 10^-6 都算命中，而指数落在扰动算子的保护区里、
+    #   数值全错后一字不动 → 5/5 白拿满档 0.20。
+    # ②「可忽略」不再单独给分：文字结论必须与数值锚同现（照化学03 rate_limiting_diffusion）。
+    #   「可否忽略」是二值判断，光押一边不算算对。
+    # ③容差带从 [1e-7, 5e-5]（宽三个数量级，×0.31 的扰动还落在里面）收成绕真值 ±15%，
+    #   且满档要求 A_ind≈1.5×10⁻⁷ 与 A_ind/Γ≈5.1×10⁻⁶ **两个独立派生量同时**命中 ——
+    #   一次数值扰动不可能把两个都打回原值（化学03 §6 的单锚教训）。
+    IND = r'a\s*_?\s*\{?\s*(?:\\?(?:mathrm|text|rm)\s*\{)?\s*ind'
+    ratio_vals = _nums(
+        IND + r'[^0-9\n]{0,12}?(?:/|\}\s*\{)\s*\\?(?:gamma|[γΓ])\s*\}?\s*[:=≈约]?',
+        full_l, 40)
+    a_ind_vals = _nums(IND + r'[^0-9\n]{0,40}?[:=≈约]', full_l, 60)
+    ratio_ok = _hit(ratio_vals, 5.1e-6, 0.15)
+    a_ind_ok = _hit(a_ind_vals, 1.5e-7, 0.15)
     e1_negligible = bool(re.search(r'(可忽略|忽略|negligible|ppm)', region_l)) \
         or bool(re.search(r'(诱导\s*e1|induced\s*e1|杂散场)[^\n]{0,60}(可忽略|忽略|negligible)', full_l))
-    ratio_vals = _nums(r'(?:a_?\s*ind\s*/\s*[γΓ]|a_?ind\s*/\s*gamma|比例?|ratio)\s*[:=≈约]?', full_l)
-    ratio_ok = any(1e-7 <= v <= 5e-5 for v in ratio_vals) \
-        or ("10^-6" in full or "10⁻⁶" in full or "e-6" in full_l or "5.1" in full)
-    if e1_negligible and ratio_ok:
-        e1_step = 0.20
-    elif e1_negligible:
-        e1_step = 0.10
+    if e1_negligible and ratio_ok and a_ind_ok:
+        e1_frac = 1.0
+    elif e1_negligible and (ratio_ok or a_ind_ok):
+        e1_frac = 0.5
     else:
-        e1_step = 0.0
+        e1_frac = 0.0
 
     non_empty = 1.0 if len(full.strip()) >= 30 else 0.0
     refusal = bool(re.search(r"(无法回答|不能回答|不会做|拒绝作答|i cannot|i can't|cannot solve)", full_l))
     not_refusal = 0.0 if refusal else 1.0
     has_unit = 1.0 if re.search(r"(s\s*\^?\{?\s*-?\s*1|s⁻¹|s\^-1|/\s*s|\d\s*s\b)", full_l) else 0.0
 
-    final_answer = 0.10 * non_empty + 0.10 * not_refusal + tau_step + branch_step \
-        + e1_step + 0.10 * has_unit
+    # 白拿口径收紧（照化学03 `_SCORED` 的注释）：三项权重归零，只留在返回 dict 里
+    # 当诊断项输出 ——
+    #   · non_empty_answer / not_refusal：空答与拒答由 runner 层记 0，在 grade() 里
+    #     再给一遍就是与题目无关的白拿（白拿项①）；
+    #   · has_unit：「全文任何位置出现 s⁻¹」的裸单位存在性检查，数值全错也一字不动
+    #     （白拿项②③）。秒量纲已作为 τ_a 结论值的**邻接条件**参与判定，不再单列计权。
+    # 释放出的 0.10×3=0.30 按比例回填三个实质项：新权重 = 旧权重/(1−0.30)。
+    # 三项全中仍是满分 1.0（(0.30+0.20+0.20)/0.70=1.0），真实分不因归零而下降。
+    W_TAU, W_BRANCH, W_E1 = 0.30 / 0.70, 0.20 / 0.70, 0.20 / 0.70
+    tau_step = W_TAU * tau_frac
+    branch_step = W_BRANCH * branch_frac
+    e1_step = W_E1 * e1_frac
+
+    final_answer = tau_step + branch_step + e1_step
     out["non_empty_answer"] = non_empty
     out["not_refusal"] = not_refusal
     out["tau_step"] = round(tau_step, 4)
@@ -162,10 +234,11 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     out["has_unit"] = has_unit
 
     # numeric 锚点命中率（4 锚点：τ_a、A(a→g)/主支、A(a→b)/10%、A_ind/Γ）
-    ab_ok = bool(re.search(r'(a\s*[→\-]+\s*b|a→b)[^\n]{0,40}(10(\.0)?\s*%|0\.10)', full_l)) \
-        or any(_relerr(v, 3.0e-3) is not None and _relerr(v, 3.0e-3) <= 0.15
-               for v in _nums(r'(a\s*[→\-]+\s*b|a→b)\s*[:=≈约]?', full_l))
-    anchors = [tau_step >= 0.30, branch_step >= 0.20, ab_ok, ratio_ok and e1_negligible]
+    ab_ok = _win(AB, MIN) or any(
+        _relerr(v, 3.0e-3) <= 0.15
+        for v, _t, _g in _nums(AB + r'\s*[:=≈约]?', full_l))
+    anchors = [tau_frac >= 1.0, branch_frac >= 1.0, ab_ok,
+               ratio_ok and a_ind_ok and e1_negligible]
     out["numeric_anchor_hit_rate"] = round(sum(1 for h in anchors if h) / 4.0, 4)
 
     out["auto_final_answer_score"] = round(final_answer, 4)
@@ -197,7 +270,7 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
 **主支归属 gate（0.60）**
 - **G4（0.60）**：正确耦合方程反演 → a→g 90% 主支，且**显式点破 b 暗态储库延迟回补**须扣除。
 - **G3（0.36）**：主支方向对（a→g 较大）但数值偏 / 机制点破不足。
-- **G2（0.24）**：建了多通道方程但**主支搞反**（把 a→b 当主支，EB5.1 那种走法）。
+- **G2（0.24）**：建了多通道方程但**主支搞反**（把 a→b 当主支）。
 - **G1（0.00）**：单指数硬套 / 漏 b→g 回补 / 编造分支。
 
 **诱导 E1 阶数（0.20）**：用二阶微扰 η²（而非一阶 ∝η）估算诱导 E1 速率给满；一阶或漏估给 0。

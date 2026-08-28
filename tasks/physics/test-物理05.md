@@ -120,9 +120,14 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     has_nd = bool(re.search(r'\bnd\b|l\s*=\s*2|d\s*系列|d\s*态|l=2', full_l))
     a_ns = bool(re.search(r'a[\s，,、]{0,6}(?:系列)?[^\n。；;]{0,20}(ns|l\s*=\s*0|s\s*系列|s\s*态)', full_l)) or (has_ns and da_hit)
     b_nd = bool(re.search(r'b[\s，,、]{0,6}(?:系列)?[^\n。；;]{0,20}(nd|l\s*=\s*2|d\s*系列|d\s*态)', full_l)) or (has_nd and db_hit)
-    assign_swapped = bool(re.search(r'a[\s，,、]{0,6}(?:系列)?[^\n。；;]{0,20}(nd|l\s*=\s*2)', full_l)) \
-        or bool(re.search(r'b[\s，,、]{0,6}(?:系列)?[^\n。；;]{0,20}(ns|l\s*=\s*0)', full_l))
-    assign_ok = a_ns and b_nd and not assign_swapped
+    # 反向项按化学03 §8 的白拿④口径改**扣分项**：命中才扣，不再当 assign_ok 的门。
+    # 旧写法两头都错：`a[\s，,、]{0,6}` 里的 a/b 是**裸字母**，会命中 `\qquad` 里的 a、
+    # `rb \(ns\)` 里的 b —— fixture 5 个 run 里 4 个误报，既把归属本来正确的答复
+    # 压成 0（假阴性、真实分被压低），又在数值全错后原样留存、被审计记成白拿项。
+    # 收紧为必须带「系列」标签，且窗内不吃过分句：只有真写反了才判搞反。
+    assign_swapped = bool(re.search(r'a\s*系列[^。\n；;]{0,24}?(?:n\s*d|l\s*=\s*2)', full_l)) \
+        or bool(re.search(r'b\s*系列[^。\n；;]{0,24}?(?:n\s*s|l\s*=\s*0)', full_l))
+    assign_ok = a_ns and b_nd
 
     # ---- 5% 检验：n=12、n=20 均判"不可用"（核心防御 gate）----
     err12 = bool(re.search(r'1[67]\.\d\s*%', full)) or ("17.2" in full) or ("17%" in full)
@@ -133,25 +138,54 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         r'(近似|微分近似|n\*?\s*\^?\s*-?\s*3|间隔)[^\n。；;]{0,24}(不能|不可|不适用|不成立|失效|均不|都不)', full_l))
     approx_both_fail = no_fit_flag and err12 and err20
 
-    # ---- 裸 n 标度：r∝n*²、τ∝n*³ 须用 n*，给高估因子 ----
-    scale_use_nstar = bool(re.search(
-        r'(有效主量子数|n\*|n\^?\*|裸\s*n)[^\n。；;]{0,40}(半径|寿命|标度|尺度|r\s*∝|τ\s*∝|不能用|须用|应用|而非)', full_l)) \
-        or ("裸 n" in full) or ("裸n" in full)
-    scale_factor_ok = (("1.83" in full and "2.48" in full) or ("1.41" in full and "1.67" in full)) \
-        or bool(re.search(r'高估.{0,10}(1\.8|2\.4|1\.4|1\.6)', full))
+    # ---- 裸 n 标度：文字结论 + 派生数值锚在邻接窗内**同现**（按白拿口径收紧）----
+    # 旧写法有两处白拿：
+    #   ① `("裸 n" in full)` / `("裸n" in full)` 是**裸子串**，而题面末段原样写着
+    #      「说明误用裸 n 代替有效主量子数对半径 r、寿命 τ 标度的影响」——复述题面即命中；
+    #      同理旧 `scale_use_nstar` 正则的 `有效主量子数 … 半径` 也在题面里齐了。
+    #   ② 旧 0.075 半档只要文字命中就发分，等于给「复述题面 + 拒答」付钱。
+    # 收紧为单一 check（不再分档）：必须给出**只有真算过才写得出的高估因子**，
+    #   且 r 与 τ 两个因子**成对**出现（只对一个说明是猜的），并且该因子须落在
+    #   「半径/寿命/高估/标度」的 40 字邻接窗内（窗口风格照抄题内 `[^\n]{0,40}`）。
+    #   正解 n=12 → r 1.83×、τ 2.48×；n=20 → r 1.41×、τ 1.67×，题面一个都没给。
+    _FACT = r'1\.8[0-6]|2\.4[4-9]|2\.5[0-2]|1\.3[89]|1\.4[0-3]|1\.6[4-9]'
+    scale_adjacent = bool(re.search(
+        r'(?:半径|寿命|高估|标度|尺度|r\s*∝|τ\s*∝)[^\n]{0,40}(?:' + _FACT + r')'
+        r'|(?:' + _FACT + r')[^\n]{0,40}(?:倍|×|高估|半径|寿命)', full))
 
+    def _pair(lo1, hi1, lo2, hi2):
+        """r 与 τ 的高估因子必须成对落窗。用 float 比较而非裸串，避免
+        `1.83` 这种子串在别处（如 `21.834`）被当成结论值。"""
+        vals = [float(v) for v in re.findall(r'([0-9]+\.[0-9]+)(?![0-9])', full)]
+        return (any(lo1 <= v <= hi1 for v in vals)
+                and any(lo2 <= v <= hi2 for v in vals))
+
+    scale_ok = scale_adjacent and (_pair(1.80, 1.86, 2.44, 2.52)
+                                   or _pair(1.39, 1.43, 1.64, 1.70))
+
+    # 以下三项按化学03 第 237-238 行口径**权重归零**、只留作诊断输出：
+    # 空答与拒答由 runner 层记 0，在 grade() 里再给一遍就是与题目无关的白拿（白拿①）；
+    # has_unit 判的是「全文任何位置出现某单位」，而它的四条支 `cm^-1` / `n*` /
+    # `有效主量子数` / `无量纲` **题面原样全有**（题面写「电离阈值跃迁波数 T=…cm^-1」、
+    # 问句写「有效主量子数」），复述题面即命中（白拿②③）。键一律保留，供逐项对照。
     non_empty = 1.0 if len(full.strip()) >= 30 else 0.0
     refusal = bool(re.search(r"(无法回答|不能回答|不会做|拒绝作答|i cannot|i can't|cannot solve)", full_l))
     not_refusal = 0.0 if refusal else 1.0
-
-    # 核心命中（0.50）：δA≈3.13 且系列/l 归属正确(0.25) + n=12/n=20 均判 n*^-3 不可用(0.25)
-    core = 0.25 * (1.0 if (da_hit and assign_ok) else 0.0) \
-         + 0.25 * (1.0 if approx_both_fail else 0.0)
     has_unit = 1.0 if (re.search(r"cm\s*\^?\{?\s*-?\s*1|cm⁻¹|cm-1", full_l)
                        or ("n*" in full_l) or ("有效主量子数" in full) or ("无量纲" in full)) else 0.0
-    scale_final = 0.15 if (scale_use_nstar and scale_factor_ok) else (0.075 if scale_use_nstar else 0.0)
 
-    final_answer = 0.10 * non_empty + 0.10 * not_refusal + core + 0.15 * has_unit + scale_final
+    # ---- 折算：归零 non_empty(0.10)+not_refusal(0.10)+has_unit(0.15)=0.35 后，
+    #      剩下的实质项按 1/(1-0.35) 等比放大，完全正确的答复仍是 1.0。----
+    _RESCALE = 1.0 / 0.65
+    # 核心命中：δA≈3.13 且系列/l 归属正确(0.25→0.3846) + n=12/n=20 均判不可用(0.25→0.3846)
+    core = (0.25 * (1.0 if (da_hit and assign_ok) else 0.0)
+            + 0.25 * (1.0 if approx_both_fail else 0.0)) * _RESCALE
+    scale_final = (0.15 if scale_ok else 0.0) * _RESCALE
+
+    # 归属搞反是扣分项（白拿④）：命中才扣，缺值不加不扣。
+    penalty = 0.25 if assign_swapped else 0.0
+
+    final_answer = max(0.0, min(1.0, core + scale_final - penalty))
     out["non_empty_answer"] = non_empty
     out["not_refusal"] = not_refusal
     out["core_hit"] = round(core, 4)
@@ -166,7 +200,7 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         db_hit,
         err12 and no_fit_flag,
         err20 and no_fit_flag,
-        scale_use_nstar and scale_factor_ok,
+        scale_ok,
     ]
     out["numeric_anchor_hit_rate"] = round(sum(1 for h in anchors if h) / 5.0, 4)
 

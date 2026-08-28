@@ -191,18 +191,13 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     compact = re.sub(r"\s+", "", text_n)
     low = text_n.lower()
 
+    # non_empty_answer / not_refusal 的权重已归零（白拿项①）：空答与拒答由 runner
+    # 层记 0，在 grade() 里再给一遍就是与题目无关的白拿。两键保留只作诊断输出。
     non_empty_answer = 1.0 if len(re.sub(r"\s+", "", text)) >= 30 else 0.0
     not_refusal = 0.0 if is_refusal(text) else 1.0
 
-    crystal_system_tetragonal = 1.0 if re.search(
-        r"四方晶系|四方系|tetragonal", text_n, re.I
-    ) else 0.0
-
-    bravais_body_centered_tetragonal = 1.0 if re.search(
-        r"体心四方|体心型四方|I\s*(?:型)?四方|I\s+tetragonal|\btI\b",
-        text_n, re.I
-    ) else 0.0
-
+    # 晶胞参数先算：a=3.90 Å、c=12.00 Å 是本题唯一真正需要「反推」的量
+    # （题面只给峰位与波长），下面所有文字结论都拿它们当数值锚。
     num = r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)"
     a_patterns = [
         r"\ba\s*=\s*b\s*(?:=|≈|~|约为?|为)\s*" + num,
@@ -215,6 +210,23 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     c_ok = any(has_near(p, 12.00, 0.035) for p in c_patterns)
     angstrom_present = bool(re.search(r"Å|埃|angstrom", text_n, re.I))
     lattice_parameters = 1.0 if a_ok and c_ok and angstrom_present else 0.0
+    # 数值同现闸门的公共部分：答复得真把这个四方胞反推出来，
+    # 「四方 / 体心四方 / 系统消光 / Z=2」这些文字结论才算有依据。
+    cell_numeric_ok = a_ok and c_ok
+
+    # ⚠️ 「四方晶系」「体心四方」原本是纯关键词判据，数值全错也 5/5 满分。
+    # 四方的判据本身就是 a=b≠c 这一组晶胞参数，故挂 cell_numeric_ok。
+    crystal_system_tetragonal = 1.0 if (cell_numeric_ok and re.search(
+        r"四方晶系|四方系|tetragonal", text_n, re.I
+    )) else 0.0
+
+    # 体心的判据是「奇和反射系统缺失」，而缺峰位置 7.36/22.78/27.24/33.32°
+    # 是题面直接给的（复述即命中）；能把它们认成 (001)(100)(102)(111) 的前提
+    # 是先反推出 a、c，故同样挂 cell_numeric_ok。
+    bravais_body_centered_tetragonal = 1.0 if (cell_numeric_ok and re.search(
+        r"体心四方|体心型四方|I\s*(?:型)?四方|I\s+tetragonal|\btI\b",
+        text_n, re.I
+    )) else 0.0
 
     volume_patterns = [
         r"(?:\bV\b|晶胞体积|体积)\s*(?:=|≈|~|约为?|为)?\s*" + num,
@@ -226,12 +238,20 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         volume_vals.extend(floats_from_matches(pat, text_n))
     volume_ok = any(close(v, 182.5, 0.04) for v in volume_vals)
     volume_ok = volume_ok or any(close(v, 1.825e-28, 0.05) for v in volume_vals)
-    cell_volume = 1.0 if volume_ok else 0.0
+    # 与 a、c 绑定判：V 必须是同一个胞的 a²c，单独一个 182.5 落窗在「仅小数」档
+    # 曾有 2/5 假命中（扰动后的别处数值落进 4% 窗）。
+    cell_volume = 1.0 if (volume_ok and cell_numeric_ok) else 0.0
 
     z_vals = floats_from_matches(
         r"\bZ\s*(?:=|≈|~|约为?|为)\s*" + num, text_n
     )
-    formula_units_z2 = 1.0 if any(close(v, 2.0, 0.06, 0.08) for v in z_vals) else 0.0
+    # ⚠️ Z=2 是小整数：只扰小数的探针碰不到它，裸判「Z≈2」在数值全错时 5/5 白拿。
+    # 按「Z 与 a/c/密度一致性绑在一起」判：Z 只有在答复自己算对了晶胞体积
+    # （V=a²c=182.5 Å³，Z=ρN_A V/M 的唯一输入）时才算数。
+    formula_units_z2 = 1.0 if (
+        any(close(v, 2.0, 0.06, 0.08) for v in z_vals)
+        and volume_ok and cell_numeric_ok
+    ) else 0.0
 
     assignments = [
         ("14.75", "002"),
@@ -280,11 +300,13 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
             absent_hkl_count += 1
     absences_ok = absent_count >= 3 or absent_hkl_count >= 3
     # 若已把体心消光条件写清、且把缺峰与体心格子挂钩，即算判定成立；
-    # 「直接列出体心禁戒的 001/100/102/111」这种写法也应接受
+    # 「直接列出体心禁戒的 001/100/102/111」这种写法也应接受。
+    # ⚠️ 同挂 cell_numeric_ok：absences_ok 只需复述题面给的四个缺峰位置就能满足，
+    # 数值全错时原判据 4/5 白拿；把它绑到反推出的 a、c 上才是真判据。
     body_centered_named = bool(re.search(
         r"体心|body[\s-]*cent|I[\s-]*(?:型)?(?:四方|centered|centred)|\btI\b",
         text_n, re.I))
-    extinction_and_absences = 1.0 if (
+    extinction_and_absences = 1.0 if cell_numeric_ok and (
         (extinction_formula and absences_ok)
         or (body_centered_named and extinction_absent_word and absences_ok
             and (hkl_symbol or absent_hkl_count >= 3))
@@ -302,16 +324,18 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         "body_centering_extinction_and_absences": extinction_and_absences
     }
 
+    # 权重按白拿口径重分配：归零 non_empty_answer + not_refusal 共 0.06，
+    # 其余各项按 旧权重/(1-0.06) 等比放大（和仍为 1.000，完全正确的答复照拿 1.0）。
     weights = {
-        "non_empty_answer": 0.03,
-        "not_refusal": 0.03,
-        "crystal_system_tetragonal": 0.10,
-        "bravais_body_centered_tetragonal": 0.20,
-        "lattice_parameters_a_c": 0.14,
-        "cell_volume": 0.10,
-        "formula_units_z2": 0.10,
-        "observed_peak_indexing": 0.20,
-        "body_centering_extinction_and_absences": 0.10
+        "non_empty_answer": 0.0,
+        "not_refusal": 0.0,
+        "crystal_system_tetragonal": 0.106383,
+        "bravais_body_centered_tetragonal": 0.212766,
+        "lattice_parameters_a_c": 0.148936,
+        "cell_volume": 0.106383,
+        "formula_units_z2": 0.106383,
+        "observed_peak_indexing": 0.212766,
+        "body_centering_extinction_and_absences": 0.106383
     }
 
     score = sum(checks[k] * weights[k] for k in weights)

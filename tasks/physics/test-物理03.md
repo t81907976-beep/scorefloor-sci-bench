@@ -328,6 +328,7 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     text = normalize_math_text(flatten_text(transcript))
     scores = {}
 
+    # non_empty_answer / not_refusal 只作诊断项输出，权重已归零（见下折算处注释）
     scores["non_empty_answer"] = 0.0 if len(text.strip()) < 30 else 1.0
     scores["not_refusal"] = 0.0 if has_any(text, [
         r'无法回答', r'不能回答', r'不会做', r'i cannot', r'i can\'t', r'cannot solve'
@@ -340,9 +341,18 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     x_val = extract_plain(text, [r'x\s*=\s*kr', r'kr'])
     scores["kR_numeric"] = 1.0 if any(close(v, 2.000, 0.05) for v in x_val) else 0.0
 
-    scores["finite_thickness_correction"] = 1.0 if has_any(text, [
-        r'1\s*-\s*cos', r'3\.3\s*%', r'0\.033', r'百分之几', r'qt\s*[:=≈约]?\s*0\.2[56]'
-    ]) else 0.0
+    # 有限厚修正：**文字/公式结论 + 数值锚同现**（照化学03 rate_limiting_diffusion 的口径）。
+    # 旧版把 `1-cos`、`百分之几` 也当独立命中支，这两支在数值全错后一字不动 —— 5/5 白拿，
+    # 判的是「提到过这个公式/说过这句话」而不是「算对了修正量」。
+    # 数值锚全部绑在自己的标签上（qt≈0.259、1-cos(qt)≈0.033=3.3%），且都是小数，
+    # 数值探针能把它们作废；裸 `0.033` 一支不许留，它会命中扰动后的无关碎片。
+    ft_pos = has_any(text, [r'1\s*-\s*cos', r'百分之几', r'系统(?:性)?修正', r'传递矩阵'])
+    ft_num = has_any(text, [
+        r'qt\s*[:=≈约]?\s*0\.2[56]\d*',
+        r'1\s*-\s*cos\s*\(?\s*(?:qt|0\.2[56]\d*)\s*\)?\s*[:=≈约]?\s*'
+        r'(?:0\.03[0-9]\d*|3\.[0-9]+\s*(?:e\s*-\s*0?2|x\s*10\s*\^?\s*-\s*0?2|%))',
+    ])
+    scores["finite_thickness_correction"] = 1.0 if (ft_pos and ft_num) else 0.0
 
     # 同一个截面在不同单位下是同一个物理答案：2.60e5 nm² = 2.602e7 Å²
     # = 2.60e-13 m² = 2.60e-7 cm² = 2.60e15 barn。只认 nm² 一种写法会把
@@ -358,17 +368,28 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         (2.60e-7, r'cm'),
         (2.60e15, r'barn'),
     )
+    # 容差 0.10 而不是 0.25：0.25 宽到能把扰动后的值放回带内 —— run3 的
+    # `2.6x10^-13 m^2` 在含整数档被扰成 `0.2002x10^-13`（=2.002e-13，相对差 0.23），
+    # 照旧判命中。这一处伪命中会让 --mixed 整题退回保守的「仅小数」档，
+    # 连带把 bound_state_count / kR_numeric 的整数结论也留在地板里。
+    #
+    # 同时补 `e` 记号支：原来只认 `x 10^n`，而 `σ_el ≈ 2.60e7 Å^2` 这种写法
+    # （run1/run4 都这么写、结论完全正确）整族丢分 —— 与容差方向相反的假阴性，
+    # 两处一起改才既压得住地板又不冤枉正确答复。
     sigma_hit = False
-    sigma_pat = (r'(-?[0-9]*\.?[0-9]+)\s*(?:x|\*)\s*10\s*\^?\{?\s*([-+]?\d+)\s*\}?'
+    sigma_pat = (r'(-?[0-9]*\.?[0-9]+)\s*'
+                 r'(?:(?:x|\*)\s*10\s*\^?\{?\s*([-+]?\d+)\s*\}?|e\s*([-+]?\d+))'
                  r'\s*(?:nm|cm|m|a|å|angstrom|埃|barn)\s*\^?\{?\s*2?\s*\}?\s*(?:²)?'
                  r'([^\n]{0,6})')
     for match in re.finditer(sigma_pat, text, flags=re.IGNORECASE):
-        if '/sr' in match.group(3).replace(' ', '').lower():
+        if '/sr' in match.group(4).replace(' ', '').lower():
             continue          # 微分截面，不是总截面
-        value = float(match.group(1)) * (10 ** int(match.group(2)))
-        unit_text = text[match.end(2):match.end(2) + 12].lower().lstrip(" ^{}")
+        exp_group = 2 if match.group(2) is not None else 3
+        value = float(match.group(1)) * (10 ** int(match.group(exp_group)))
+        pos = match.end(exp_group)
+        unit_text = text[pos:pos + 12].lower().lstrip(" ^{}")
         for target, unit in sigma_forms:
-            if close(value, target, 0.25) and re.match(unit, unit_text):
+            if close(value, target, 0.10) and re.match(unit, unit_text):
                 sigma_hit = True
                 break
         if sigma_hit:
@@ -401,6 +422,11 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     ])
     scores["bound_state_count"] = 1.0 if (space_count_ok and spin_count_ok) else 0.0
 
+    # 束缚态类型：第 5 类白拿项（纯文字/定性结论）。数值扰动原理上测不到它 ——
+    # 「只存在 s、p 束缚态」是定性判定，改数字不改结论词，所以它会稳定留在数值地板里。
+    # 不给它硬塞数值闸门（塞了就是把一条本来该由标签替换算子覆盖的判据改错），
+    # 覆盖它的应当是 scripts/audit_label_swap.py + tests/fixtures/conclusion-label-pairs.json；
+    # ⚠️ 该清单里目前没有本题的条目，等于这一项当前无任何算子覆盖。
     scores["bound_state_types"] = 1.0 if (
         has_any(text, [r's\s*[态波]', r'l\s*=\s*0'])
         and has_any(text, [r'p\s*[态波]', r'l\s*=\s*1'])
@@ -411,17 +437,30 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         r'nm\s*(?:\^?2|²)', r'm\s*(?:\^?2|²)', r'barn', r'cm\s*(?:\^?2|²)'
     ]) else 0.0
 
-    scores["auto_final_answer_score"] = (
-        0.05 * scores["non_empty_answer"]
-        + 0.05 * scores["not_refusal"]
-        + 0.20 * scores["beta_numeric"]
-        + 0.10 * scores["kR_numeric"]
-        + 0.15 * scores["finite_thickness_correction"]
-        + 0.20 * scores["sigma_tot_numeric"]
-        + 0.15 * scores["bound_state_count"]
-        + 0.05 * scores["bound_state_types"]
-        + 0.05 * scores["has_area_unit"]
-    )
+    # 白拿口径收紧（照化学03 `_SCORED` 的注释）：三项权重归零，只留在返回 dict 里
+    # 当诊断项输出（不删键，审计脚本与回归 fixture 要逐项对照）——
+    #   · non_empty_answer / not_refusal：空答与拒答由 runner 层记 0，在 grade() 里
+    #     再给一遍就是与题目无关的白拿（白拿项①）；
+    #   · has_area_unit：「全文任何位置出现 nm²/m²/barn」的裸单位存在性检查，数值全错
+    #     也一字不动（白拿项②③）。面积单位已经是 sigma_tot_numeric 的**邻接条件**
+    #     （数值+单位一起判，见上），不再单列计权。
+    # 释放出的 0.05×3=0.15 按比例回填 6 个实质项：新权重 = 旧权重/(1−0.15)，即
+    #   beta 0.2353 / kR 0.1176 / finite 0.1765 / sigma 0.2353 / count 0.1765 / types 0.0588。
+    # 六项全中仍是满分 1.0（0.85/0.85），真实分不因归零而下降。
+    #
+    # 残留说明（数值探针压不掉、但不属白拿的两类）：
+    #   · kR_numeric、bound_state_count 的结论是**整数**（kR=2；空间态 4 / 含自旋 8），
+    #     只扰小数的探针结构上碰不到，必须由「含整数」档覆盖 —— 这正是上面把 sigma 容差
+    #     收到 0.10 的目的：不让本题再退回仅小数档。
+    #   · bound_state_types 是定性结论，归标签替换算子（见该项注释）。
+    _R = 1.0 - 0.15
+    scores["auto_final_answer_score"] = round(
+        (0.20 / _R) * scores["beta_numeric"]
+        + (0.10 / _R) * scores["kR_numeric"]
+        + (0.15 / _R) * scores["finite_thickness_correction"]
+        + (0.20 / _R) * scores["sigma_tot_numeric"]
+        + (0.15 / _R) * scores["bound_state_count"]
+        + (0.05 / _R) * scores["bound_state_types"], 4)
 
     return scores
 ```

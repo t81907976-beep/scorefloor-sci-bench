@@ -282,6 +282,8 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     compact = re.sub(r"\s+", "", norm)
     numbers = all_numbers(norm)
 
+    # non_empty_answer / not_refusal 的权重已归零（白拿项①）：空答与拒答由 runner
+    # 层记 0，在 grade() 里再给一遍就是与题目无关的白拿。两键保留只作诊断输出。
     non_empty_answer = 1.0 if len(answer.strip()) >= 30 else 0.0
     not_refusal = 1.0 if answer.strip() and not refused(answer) else 0.0
 
@@ -321,8 +323,13 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         and ("(v+u)" in compact)
         and ("π" in norm or "pi" in norm)
     )
+    # ⚠️ 原判据三条全是文字/结构条件，数值全错时一字不动（实测 2/5 白拿）。
+    # 挂上派生数值锚 halfwidth_ok（a=W/2=1.20e5 m/s）：f0(v) 的全部数值内容就是
+    # 这个半宽参数，而「W 是半高全宽、Lorentzian 参数是半高半宽」正是本题的陷阱，
+    # 题面只给 W=240 km/s，a 必须自己折半并换算才拿得到。
     equilibrium_distribution = 1.0 if (
         equal_weight_language and pv_language and distribution_evidence
+        and halfwidth_ok
     ) else 0.0
 
     # 半宽符号写作 a / Γ / Δ 均可（normalize 后 Γ、Δ 已折成 γ、δ），判据只看
@@ -335,7 +342,13 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         "下方绕过", "下方绕行", "下方通过", "下方绕开", "极点下方",
         "ω→ω+i0", "ω->ω+i0", "ω+i0^+", "omega→omega+i0", "omega->omega+i0"
     ])
-    landau_sign = 1.0 if plus_ika and causal_direction and not minus_ika else 0.0
+    # ⚠️ 原判据只看 `+ika` 这个结构与「下方绕过」这句话，数值全错时一字不动
+    # （实测 4/5 白拿，是本题地板的主要来源）。挂上派生数值锚 B=ka=6.60e7 s^-1：
+    # 它就是 +ika 这一项的数值大小，只有把 k 换成 550 m^-1、且识破 a=W/2 才写得出。
+    landau_shift_value = has_num(6.60e7, 0.03)
+    landau_sign = 1.0 if (
+        plus_ika and causal_direction and not minus_ika and landau_shift_value
+    ) else 0.0
 
     electron_candidate = 1.0 if (
         has_num(1.545e10, 0.03)
@@ -372,12 +385,17 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         and ion_ignored and not explicitly_include_ions
     ) else 0.0
 
-    unstable_language = contains_any_compact([
-        "系统不稳定", "存在不稳定模", "不稳定的", "判定不稳定", "仍强不稳定",
-    ])
-    # 「纯增长」的等价表述：纯虚根 / Re ω=0 / 无实频振荡，都是同一个物理结论。
+    # 原白名单只有「系统不稳定 / 存在不稳定模 / 不稳定的 / 判定不稳定 / 仍强不稳定」
+    # 五条，实测 3/5 答复写「系统存在电子双流不稳定」「系统在给定参数下为电子双流
+    # 不稳定」「因此存在一个纯增长不稳定根」，结论相同却集体判 0（假阴性）。
+    # 改为「出现不稳定结论且没有被否定」；本项的判别力由下面的 positive_i_root
+    # （γ=9.16e8 数值锚）承担，放宽措辞不会抬高地板。
+    unstable_language = bool(re.search(r"不稳定", compact)) and not bool(
+        re.search(r"(?:不是|并非|没有|不存在|不会|无)不稳定|系统(?:是)?稳定"
+                  r"|判定(?:为)?稳定|结论(?:：|:)?稳定", compact))
+    # 「纯增长」的等价表述：纯虚根 / Re ω=0 / 无实频振荡 / 非振荡型，都是同一个物理结论。
     pure_growth_language = contains_any_compact([
-        "纯增长", "非振荡增长", "非振荡的增长", "无实频振荡", "无实频",
+        "纯增长", "非振荡", "无实频振荡", "无实频",
         "纯虚根", "纯虚", "reω=0", "re(ω)=0",
     ])
     correct_positive_root = positive_i_root(9.16e8, 0.03)
@@ -408,16 +426,18 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         "nonrelativistic_self_consistency": nonrelativistic_check,
     }
 
+    # 权重按白拿口径重分配：归零 non_empty_answer + not_refusal 共 0.06，
+    # 其余各项按 旧权重/(1-0.06) 等比放大（和仍为 1.000，完全正确的答复照拿 1.0）。
     weights = {
-        "non_empty_answer": 0.03,
-        "not_refusal": 0.03,
-        "parameter_setup": 0.10,
-        "equilibrium_distribution": 0.08,
-        "landau_causal_sign": 0.16,
-        "electron_candidate_root": 0.20,
-        "ion_model_decision": 0.20,
-        "final_instability_direction": 0.12,
-        "nonrelativistic_self_consistency": 0.08,
+        "non_empty_answer": 0.0,
+        "not_refusal": 0.0,
+        "parameter_setup": 0.106383,
+        "equilibrium_distribution": 0.085106,
+        "landau_causal_sign": 0.170213,
+        "electron_candidate_root": 0.212766,
+        "ion_model_decision": 0.212766,
+        "final_instability_direction": 0.127660,
+        "nonrelativistic_self_consistency": 0.085106,
     }
 
     total = 0.0
