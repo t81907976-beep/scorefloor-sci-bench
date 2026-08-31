@@ -192,30 +192,77 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     t2_vals = _nums(r'(?:t\s*_?\s*2|下降段|下降斜坡)\s*[:=≈约]?', full_l)
     t2_hit = any(_mag_ok(v, 142.8, 0.06) for v in t2_vals)
 
-    # 两个跳跃识别为稀疏波（防御位：不能把发散特征当成激波）
+    # ---- 两个跳跃识别为稀疏波（0.20 核心防御位）----
+    # 旧写法是**纯关键词**判据，数值全错后 5/5 原样留存（白拿）。病因在题面第 25 行：
+    # 结论格式行原样写着「s=40 跳跃: 稀疏波/激波(淘汰/保留)；s=0/300 跳跃: 稀疏波/激波(淘汰/保留)」
+    # —— `稀疏波`、`淘汰`、`40`、`0/300` 四个词全在同一行，复述题面即同时喂饱
+    # rarefaction_kw、jump40、jump0 三个条件，这 0.20 与答案对错完全无关。
+    # 按白拿口径加**派生数值锚同现闸门**：结论词的 ±120 字邻接窗内必须出现该跳跃
+    # 自己的派生量（题面一个都没给，只有真做了熵条件检验才写得出）：
+    #   s=40   跳跃：c_L=1.48U、s_RH=1.62U、c_R=1.72U，或通量 f(0.10)=0.126、f(0.20)=0.288
+    #   s=0/300 跳跃：s_RH=1.4016U、c_L=1.3168U，或 f(0.06)=0.069936
+    # 窗口取 ±120 字（±80 会漏掉 run3 的 s=0/300 段，那份把数值算在结论前两句）。
+    _CONCL = r'稀疏|淘汰|排除|不是激波|发散|不满足'
+    _N40 = r'1\.48\d*|1\.62\d*|1\.7[12]\d*|0\.126\d*|0\.288\d*'
+    _N0 = r'1\.31[67]\d*|1\.40[012]\d*|0\.0699\d*'
+
+    def _concl_with_num(nums, span=120):
+        """结论词邻接窗内是否同现该跳跃的派生数值锚。"""
+        for m in re.finditer(_CONCL, full_l):
+            seg = full_l[max(0, m.start() - span):m.end() + span]
+            if re.search(nums, seg):
+                return True
+        return False
+
     rarefaction_kw = bool(re.search(r'稀疏波|rarefaction|膨胀波|特征.{0,6}(发散|张开)', full_l))
-    jump40 = bool(re.search(r'(40)[^\n。；;]{0,40}(稀疏|淘汰|排除|不是激波|发散)', full_l))
-    jump0 = bool(re.search(r'(0\s*/\s*300|300|剪开|周期|环形边界|环形.{0,4}间断)[^\n。；;]{0,40}(稀疏|淘汰|排除|发散)', full_l))
+    jump40 = bool(re.search(r'(40)[^\n。；;]{0,40}(稀疏|淘汰|排除|不是激波|发散)', full_l)) \
+        and _concl_with_num(_N40)
+    jump0 = bool(re.search(r'(0\s*/\s*300|300|剪开|周期|环形边界|环形.{0,4}间断)[^\n。；;]{0,40}(稀疏|淘汰|排除|发散)', full_l)) \
+        and _concl_with_num(_N0)
     both_rarefaction = rarefaction_kw and jump40 and jump0
 
-    # 上升段为首个激波、下降段更晚
-    order_ok = bool(re.search(r'(上升|85).{0,60}(首个|最先|先破裂|最早)', full_l)) and \
-               bool(re.search(r'(下降|160|t\s*_?\s*2)[^\n。；;]{0,30}(更晚|晚于|之后|滞后)', full_l))
+    # ---- 上升段为首个激波、下降段更晚 ----
+    # 旧写法 `(上升|85).{0,60}(首个|最先|先破裂|最早)` + `(下降|160|t_2)…(更晚|晚于)`
+    # 同样是纯关键词 + 字符距离，两头都出问题：
+    #   ① 后半句被题面第 25 行的「下降段激波 t=…(更早/更晚)」直接喂饱（复述即命中）；
+    #   ② 前半句靠 60 字窗口，run0/run1 结论写对了却没套住（真实分被压低 0.10），
+    #      而扰动后数字长度一变、窗口反而套住了 —— run0 real=0 → 扰动档=1，
+    #      属于**凭空造分**（比单纯白拿更坏）。
+    # 收紧为：破裂序的文字结论必须与两段各自的时刻锚在 ±60 字邻接窗内同现 ——
+    # 上升段侧 t1≈76.0 s、下降段侧 t2≈142.8 s，两个时刻题面都没给。
+    def _order_side(kw, nums, span=60):
+        for m in re.finditer(kw, full_l):
+            seg = full_l[max(0, m.start() - span):m.end() + span]
+            if re.search(nums, seg):
+                return True
+        return False
 
+    order_ok = _order_side(r'上升|升段|首个|最先|最早|先破裂', r'7[56]\.\d') \
+        and _order_side(r'更晚|晚于|较晚|滞后', r'14[23]\.\d')
+
+    # 以下三项按化学03 第 237-238 行口径**权重归零**、只留作诊断输出（键不删，
+    # 供审计脚本与回归 fixture 的逐项对照）：空答与拒答由 runner 层记 0，
+    # 在 grade() 里再给一遍就是与题目无关的白拿（白拿①）；has_unit 判的是
+    # 「全文任何位置出现某单位」，而 `cm/s`、`cm`、`s` 题面原样全有（题面写
+    # 「D=9.00×10^{-6} cm^2/s」「E=450 V/cm」），复述题面即命中（白拿②③）。
+    # 注：has_unit 在旧版就已不进总分，这里只补上归零口径的说明。
     non_empty = 1.0 if len(full.strip()) >= 30 else 0.0
     refusal = bool(re.search(r"(无法回答|不能回答|不会做|拒绝作答|i cannot|i can't|cannot solve)", full_l))
     not_refusal = 0.0 if refusal else 1.0
 
     has_unit = 1.0 if re.search(r'cm\s*/\s*s|cm/s|\bs\b|秒|\bcm\b', full_l) else 0.0
 
-    core = 0.20 * (1.0 if t1_hit else 0.0) \
-         + 0.15 * (1.0 if s1_hit else 0.0) \
-         + 0.10 * (1.0 if u_hit else 0.0)
-    defense = 0.20 * (1.0 if both_rarefaction else 0.0) \
-            + 0.10 * (1.0 if order_ok else 0.0) \
-            + 0.05 * (1.0 if t2_hit else 0.0)
+    # ---- 折算：归零 non_empty(0.10)+not_refusal(0.10)=0.20 后，剩下的实质项
+    #      按 1/(1-0.20)=1.25 等比放大，完全正确的答复仍是 1.0。----
+    _RESCALE = 1.25
+    core = (0.20 * (1.0 if t1_hit else 0.0)
+            + 0.15 * (1.0 if s1_hit else 0.0)
+            + 0.10 * (1.0 if u_hit else 0.0)) * _RESCALE
+    defense = (0.20 * (1.0 if both_rarefaction else 0.0)
+               + 0.10 * (1.0 if order_ok else 0.0)
+               + 0.05 * (1.0 if t2_hit else 0.0)) * _RESCALE
 
-    final_answer = 0.10 * non_empty + 0.10 * not_refusal + core + defense
+    final_answer = max(0.0, min(1.0, core + defense))
     out["non_empty_answer"] = non_empty
     out["not_refusal"] = not_refusal
     out["u_hit"] = 1.0 if u_hit else 0.0

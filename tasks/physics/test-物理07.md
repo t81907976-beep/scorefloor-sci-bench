@@ -110,7 +110,7 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
                 vals.append(v)
         return vals
 
-    def _nums_u(pattern, text, unit, span=56):
+    def _nums_u(pattern, text, unit, span=56, cut=None, drop_interm=False):
         """与 _nums 同样在标签后窗口内全量收集，但**只收紧跟单位的数值**。
 
         只放宽窗口不锚单位会走到另一个极端：窗口里 `(4π/k^2)`、`(2l+1)`、
@@ -118,15 +118,32 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
         2.485 落进 2.3626 的 10% 带，于是把结论改错的答复照样判命中——检查项
         失去了「答错要扣分」的能力。相移必带 rad/°、截面必带 barn/fm²、
         束缚能必带 MeV，用单位把结论值和过程中的裸数字分开。
+
+        `cut` 是**窗口截断词**：命中它之后的内容一律不收。用来堵「判据窗口吃到
+        另一半结论」这类假阳性 —— δ0 与 δ1 常写在同一个 boxed 块或同一个标题里
+        （`## 2) 相移 (δ_0, δ_1)`、`boxed{δ_0≈…, δ_1≈…}`），56 字窗从 δ_1 出发
+        会一路吃到 δ_0 的值。fixture 实测：某 run 把 δ1 算成 -3.2e-2 rad（真错），
+        扰动后 δ_0 的 -0.78 被放大成 -31.98°、落进 δ1=35° 的 10% 带，δ1 于是
+        「答错也命中」，还顺带把 retain_s_p_waves 的四锚计数顶到 2。
+
+        `drop_interm` 丢掉**算式中间项**：带单位的数值后面若紧跟 `≈`/`=`/`→`，
+        它是等号左边的被乘数而不是结论（`σ_tot ≈ 4π/0.0956 × 4.79 fm² ≈ 194 fm²`
+        里的 4.79）。扰动把这个中间项放大到 196.39 fm² 时，它落进 192 fm² 的
+        8% 带，答案全错却判命中 —— 与「窗口吃到另一半结论」同族的白拿。
         """
         vals = []
         num = (r'([-+]?)\s*([0-9]*\.?[0-9]+)\s*'
                r'(?:[×x*]\s*10\s*\^?\{?\s*([-+]?\d+)\s*\}?|e\s*([-+]?\d+))?')
+        interm = re.compile(r'^\s*\\?[\)\}\]]*\s*(?:≈|=|→)')
         for m in re.finditer(pattern, text, flags=re.IGNORECASE):
             seg = text[m.end():m.end() + span]
+            if cut:
+                seg = re.split(cut, seg, flags=re.IGNORECASE)[0]
             for sm in re.finditer(num + r'\s*\\?[,;: ]*\s*(?:' + unit + r')',
                                   seg, flags=re.IGNORECASE):
                 if not sm.group(2):
+                    continue
+                if drop_interm and interm.match(seg[sm.end():sm.end() + 8]):
                     continue
                 v = float(sm.group(2))
                 exp = sm.group(3) or sm.group(4)
@@ -161,22 +178,47 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     # δ0=π-0.779=2.363 rad（135.4°），与 -0.779 是同一个相移，只认 -0.779
     # 会把「取物理支表述」记成算错。数值必须紧跟 rad/° 才计入，否则窗口里的
     # `代入qd=1.506×1.65≈2.485` 会假冒 2.363。
+    # δ0 与 δ1 互为窗口截断词（见 _nums_u 的 `cut` 说明）：两个相移常挤在同一行/
+    # 同一个 boxed 块里，不截断就会互相偷值。
+    _CUT_D1 = r'δ\s*_?\s*1|delta\s*_?\s*1|p\s*波'
+    _CUT_D0 = r'δ\s*_?\s*0|delta\s*_?\s*0|s\s*波'
     d0_vals = _nums_u(r'(?:δ\s*_?\s*0|delta\s*_?\s*0|δ0|相移\s*δ?\s*0|s\s*波相移)\s*[:=≈约]?',
-                      full_l, _U_RAD)
-    d0_hit = any(_mag_ok(v, 0.779, 0.10) or _mag_ok(v, 2.3626, 0.10)
-                 or _mag_ok(v, 44.6, 0.10) or _mag_ok(v, 135.4, 0.10)
-                 for v in d0_vals)
+                      full_l, _U_RAD, cut=_CUT_D1)
+    # 两支各绑符号，杜绝探针共振：负值只认主值支 -0.779 rad / -44.6°，
+    # 正值只认 Levinson 等价支 +2.3626 rad(=π-0.779) / +135.4°。
+    # 若两支都用 abs() 各留 ±10% 带，量级 ×3 的数值扰动会把 -0.779 扰成 -2.337、
+    # 其绝对值正好落进 2.3626 的带内（2.3626/0.779=3.03≈3），答错也判命中。
+    # 绑符号后负支的扰动值仍是负、只与 0.779 比，落不进大支，共振消除；
+    # 正确答复无论写 -0.779 还是 +2.3626 都命中对应支。
+    def _d0_ok(v):
+        if v < 0:
+            return _mag_ok(v, 0.779, 0.10) or _mag_ok(v, 44.6, 0.10)
+        return _mag_ok(v, 2.3626, 0.10) or _mag_ok(v, 135.4, 0.10)
+
+    d0_hit = any(_d0_ok(v) for v in d0_vals)
 
     # p 波相移 δ1≈+0.611 rad（≈35.0°）
     d1_vals = _nums_u(r'(?:δ\s*_?\s*1|delta\s*_?\s*1|δ1|p\s*波相移)\s*[:=≈约]?',
-                      full_l, _U_RAD)
+                      full_l, _U_RAD, cut=_CUT_D0)
     d1_hit = any(_mag_ok(v, 0.611, 0.10) or _mag_ok(v, 35.0, 0.10) for v in d1_vals)
 
     # 总弹性截面 σ_el≈1.92 barn（≈192 fm²）。σ 与结论数值常被下标、\frac 或换行
     # 隔开（`σ_el=σ_0+σ_1≈1.937 b`），故窗口放宽到 56 字符，但只收「数值+截面单位」，
     # 否则 `(4π/k^2)(2l+1)` 里的裸 2 会落进 1.92 的容差带、答错也判命中。
-    sig_vals = _nums_u(r'(?:σ\s*_?\s*(?:el|tot)?|sigma|总弹性截面|总截面|弹性截面)\s*[:=≈约]?',
-                       full_l, _U_AREA)
+    #
+    # 标签走**白名单**：只认 σ_el / σ_tot / 裸 σ（含 `σ_{\rm el}`、`σ_{\text{tot}}`
+    # 这类壳未被 _normalize 剥掉的写法），凡带其它下标一律不认。
+    # 黑名单挡不住：原先的 `σ\s*_?\s*(?:el|tot)?` 对下标可有可无，`σ_l=(4π)/(k^2)(2l+1)`
+    # 与分波截面 σ_0 照样把整条公式的窗口交出去。而 σ_0≈0.643 barn 的 ×3 扰动值
+    # =1.929 正落进 σ_el≈1.92 的 8% 带 —— 比值 2.99≈3 不是巧合，是本题物理自带的
+    # 比例支（σ_el=σ_0+σ_1 且 σ_1≈2σ_0），与 δ0 的双支同族。
+    # 窗口再切掉单位换算说明句：`由于 1 barn = 100 fm²` 里的 `1 barn` 不是结论，
+    # 而含整数档会把它扰成 `2 barn` —— 2.0 落进 1.92 的 8% 带，答案全错也判命中。
+    _CUT_SIG = r'由于|因为|注意|换算|其中'
+    _SIG_SUB = r'(?:_\s*\{?\s*(?:\\[a-z]+\s*)?(?:el|tot|total|总|弹性)\s*\}?)'
+    sig_vals = _nums_u(r'(?:(?:σ|sigma)\s*' + _SIG_SUB + r'?(?!\s*_)'
+                       r'|总弹性截面|总截面|弹性截面)\s*[:=≈约]?',
+                       full_l, _U_AREA, cut=_CUT_SIG, drop_interm=True)
     sig_hit = any(_mag_ok(v, 1.92, 0.08) or _mag_ok(v, 192.0, 0.08) for v in sig_vals)
 
     # s 波束缚能 B≈11.4 MeV。标签写法多样：B、B_s、E_B、束缚能、结合能。
@@ -184,10 +226,18 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
                      r'\s*[:=≈约]?', full_l, _U_MEV)
     b_hit = any(_mag_ok(v, 11.4, 0.08) for v in b_vals)
 
-    # 保留 s、p 两个分波（l=0,1），防御位：不能只留 s 波或误加高分波
-    retain_sp = bool(re.search(
+    # 保留 s、p 两个分波（l=0,1），防御位：不能只留 s 波或误加高分波。
+    # 这条结论文字在数值扰动下一个字不变，旧写法因此 5/5 白拿，必须绑数值锚。
+    # 但**不能绑单锚 OR**：任一锚共振就白送这 0.10（σ_0×3≈σ_el 就是这样被放大的）。
+    # 也**不能改绑 d1/sig**（看起来最"相关"的两个）：fixture 里有一个 run 把 δ1 算成
+    # -3.2e-2 rad、σ_el 因此只剩 σ_0，但它的截断结论 l=0,1 与 σ_2≈1e-6 barn 是对的
+    # —— 绑 d1 或 sig 会把一个答对的子问题判成答错。
+    # 取「四锚至少中两个」：那个 run 有 δ0+B 两个 ⇒ 不误伤真实分；扰动后四锚最多
+    # 只剩一个共振锚 ⇒ 放大链断掉。
+    retain_sp = (bool(re.search(
         r'(保留|需保留|截断).{0,40}(s\s*波.{0,6}p\s*波|p\s*波.{0,6}s\s*波|l\s*=\s*0.{0,6}1|l\s*=\s*0\s*[,，、]\s*1)',
-        full_l)) or bool(re.search(r'l\s*=\s*0\s*[,，、和与]\s*1', full_l))
+        full_l)) or bool(re.search(r'l\s*=\s*0\s*[,，、和与]\s*1', full_l))) \
+        and sum((d0_hit, d1_hit, sig_hit, b_hit)) >= 2
 
     # 光学定理一致性检验存在。剥壳后 `\text{Im}\,f(0)` → `im f(0)`；
     # 答复也常写 `4π/k · Im f(0)` 或 `σ_tot=σ_el`（实势无吸收）作为检验落点。
@@ -200,19 +250,30 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     bound_exists = bool(re.search(r'存在.{0,8}s\s*波.{0,4}束缚态|存在.{0,4}(一个)?.{0,4}s\s*波束缚态|s\s*波束缚态.{0,6}存在', full_l)) \
                    or bool(re.search(r'存在(一个)?束缚态', full_l))
 
+    # 以下三项按化学03 第 237-238 行口径**权重归零**、只留作诊断输出（键不删，
+    # 供审计脚本与回归 fixture 的逐项对照）：空答与拒答由 runner 层记 0，在 grade()
+    # 里再给一遍就是与题目无关的白拿（白拿①）；has_unit 判的是「全文任何位置出现
+    # 某单位」，而它的每一条支 `fm^-1` / `barn` / `fm^2` / `MeV` / `rad` **题面原样
+    # 全有**（题面写「V(r)=-45.0 MeV」「0.35 fm」「<10^-3 barn」「ℏc=197.3 MeV·fm」），
+    # 复述题面即命中（白拿②③）。
     non_empty = 1.0 if len(full.strip()) >= 30 else 0.0
     refusal = bool(re.search(r"(无法回答|不能回答|不会做|拒绝作答|i cannot|i can't|cannot solve)", full_l))
     not_refusal = 0.0 if refusal else 1.0
 
     has_unit = 1.0 if re.search(r'fm\s*\^?\{?\s*-?\s*1|fm⁻¹|barn|fm\s*\^?\{?\s*2|fm²|mev|rad', full_l) else 0.0
 
-    core = 0.15 * (1.0 if d0_hit else 0.0) \
-         + 0.15 * (1.0 if d1_hit else 0.0) \
-         + 0.20 * (1.0 if sig_hit else 0.0) \
-         + 0.15 * (1.0 if b_hit else 0.0)
-    defense = 0.10 * (1.0 if retain_sp else 0.0)
+    # ---- 折算：归零 non_empty(0.10)+not_refusal(0.10)+has_unit(0.05)=0.25 后，
+    #      剩下的实质项按 1/(1-0.25) 等比放大，完全正确的答复仍是 1.0。
+    #      δ0 0.15→0.20、δ1 0.15→0.20、σ_el 0.20→0.2667、B 0.15→0.20、
+    #      retain 0.10→0.1333。----
+    _RESCALE = 1.0 / 0.75
+    core = (0.15 * (1.0 if d0_hit else 0.0)
+            + 0.15 * (1.0 if d1_hit else 0.0)
+            + 0.20 * (1.0 if sig_hit else 0.0)
+            + 0.15 * (1.0 if b_hit else 0.0)) * _RESCALE
+    defense = (0.10 * (1.0 if retain_sp else 0.0)) * _RESCALE
 
-    final_answer = 0.10 * non_empty + 0.10 * not_refusal + core + defense + 0.05 * has_unit
+    final_answer = max(0.0, min(1.0, core + defense))
 
     out["non_empty_answer"] = non_empty
     out["not_refusal"] = not_refusal

@@ -124,24 +124,52 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     lz_wrong_axis = any(0.10 <= abs(v) <= 0.35 for v in lz_vals) and not lz_hit
 
     triaxial = bool(re.search(r'三轴|共焦椭球|triaxial|scalene|ellipsoidal\s+coordinate', full_l))
-    crit_uc = ("0.0424" in full) or ("0.04243" in full) or ("0.01414" in full) or ("0.014142" in full) \
-              or bool(re.search(r'(√\s*2|\\sqrt\{?2|1\.414)\s*[×x*·]?\s*(u|0\.010)', full_norm)) \
-              or ("合成标准不确定度" in full) or ("合成不确定度" in full)
+    # 判据项加数值同现闸门（按化学题白拿口径收紧）。
+    # 原 crit_uc 末尾有两条**纯关键词**支（「合成标准不确定度」/「合成不确定度」），
+    # 而这两个词就印在题面第 8 行；`triaxial` 要的三个候选坐标系又连正确答案一起
+    # 列在题面第 11 行 —— 于是「复述题面 + 拒答」就白拿这 0.25（扰动算子实测 5/5）。
+    # 两条纯关键词支已删，只认必须自己算出来的派生量，且每一支绑到自己的标签上
+    # （裸小数会被扰动后的无关碎片命中：实测扰动样本里伪造出过 `19.05`）：
+    #   · 合成标准不确定度 u_c=√2·0.010=0.01414 μm 与判等阈值 3u_c=0.04243 μm；
+    #     数值锚必须写足 5 位有效数字：只写 4 位（`0.0424`）会被扰动算子的自伤命中 ——
+    #     u_c 与 3u_c 正好差 3 倍，而 `_SCRAMBLE` 因子表里就有 3.0，含整数档下
+    #     `0.01414×3=0.04242` 恰好落进 4 位窗（实测该档伪命中 0.385）。
+    #   · 或退极化因子三元组 L_x≈0.15630、L_y≈0.26715、L_z≈0.57655 **同时**出现 ——
+    #     三个椭圆积分、和为 1，只有真把三轴情形算对才写得出（派生数值锚，
+    #     一次数值扰动不可能把三个都打回原值）。
+    crit_uc = bool(
+        re.search(r'(?:u_|3u|不确定度|阈值|threshold)[^\n]{0,30}'
+                  r'(?:0\.01414\d*|0\.04243\d*|1\.4142?\d*×?10\^?-2|4\.242[0-9]?\d*×?10\^?-2)',
+                  full_norm)
+        or (re.search(r'0\.156\d*', full_norm) and re.search(r'0\.267\d*', full_norm)
+            and re.search(r'0\.57[67]\d*', full_norm)))
     triaxial_by_crit = triaxial and crit_uc
 
     axes_ok = ("19.05" in full and "12.7" in full and "6.35" in full) \
               or ("3:2:1" in full.replace(" ", "")) or ("3 : 2 : 1" in full)
 
+    # ── 以下三项按化学题的白拿口径归零权重，只留作诊断项输出 ──────────────
+    # 白拿①：non_empty_answer / not_refusal —— 空答与拒答由 runner 层记 0，
+    #   在 grade() 里再给一遍就是与题目无关的白拿。
+    # 白拿②③：has_unit —— 「全文任何位置出现 C·m」和答案对错无关，
+    #   单位是否配得上结论已经并进 pz_hit 的「符号=数值 + 量级窗」抽取里判。
+    # 三个键都保留（回归 fixture 与审计脚本按键逐项对照），只是权重为 0。
     non_empty = 1.0 if len(full.strip()) >= 30 else 0.0
     refusal = bool(re.search(r"(无法回答|不能回答|不会做|拒绝作答|i cannot|i can't|cannot solve)", full_l))
     not_refusal = 0.0 if refusal else 1.0
-
-    core = 0.25 * (1.0 if pz_hit else 0.0) \
-         + 0.25 * (1.0 if triaxial_by_crit else 0.0)
     has_unit = 1.0 if re.search(r"c\s*[·⋅.]?\s*m|c\s*·\s*m|coulomb\s*[- ]?\s*met", full_norm) else 0.0
-    lz_final = 0.15 if lz_hit else 0.0
 
-    final_answer = 0.10 * non_empty + 0.10 * not_refusal + core + 0.15 * has_unit + lz_final
+    # 归零的三项原权重合计 0.10+0.10+0.15=0.35，按比例重分配给剩下的实质项：
+    #   新权重 = 旧权重/(1-0.35) —— pz/坐标判据各 0.25→5/13≈0.3846、L_z 0.15→3/13≈0.2308。
+    # 三项全中仍是 5/13+5/13+3/13=1.000，完全正确的答复分数不降。
+    W_PZ = W_TRI = 0.25 / 0.65
+    W_LZ = 0.15 / 0.65
+
+    core = W_PZ * (1.0 if pz_hit else 0.0) \
+         + W_TRI * (1.0 if triaxial_by_crit else 0.0)
+    lz_final = W_LZ if lz_hit else 0.0
+
+    final_answer = core + lz_final
     out["non_empty_answer"] = non_empty
     out["not_refusal"] = not_refusal
     out["pz_hit"] = 1.0 if pz_hit else 0.0
@@ -152,7 +180,7 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     anchors = [pz_hit, lz_hit, axes_ok, triaxial_by_crit]
     out["numeric_anchor_hit_rate"] = round(sum(1 for h in anchors if h) / 4.0, 4)
 
-    out["auto_final_answer_score"] = round(final_answer, 4)
+    out["auto_final_answer_score"] = round(min(1.0, final_answer), 4)
     return out
 ```
 
