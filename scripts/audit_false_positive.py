@@ -145,17 +145,36 @@ def perturb_scramble(text: str, flip_sign: bool = False,
 def _mixed_report(cases, tasks, args) -> int:
     """按题定档的地板表：这是当前推荐口径。
 
-    定档规则：一道题在「含整数」档下**不产生任何新伪命中**（没有哪个 check
-    从仅小数档的「不命中」翻成命中）就采用含整数档的地板，否则保守退回仅小数档。
+    定档规则：一道题在「含整数」档下**不产生任何抬高地板的新伪命中**就采用含整数档
+    的地板，否则保守退回仅小数档。
 
     为什么按题而不按 check 定：地板是题级聚合量，一道题里只要有一个 check 在
     含整数档下变噪声，该题的含整数地板就不可信；而 check 级混合会拼出
     「题目从未实际产生过的分数组合」，与 `_robust_grade` 不逐 check 挑最优是同一个道理。
+
+    ⚠️ 0903 修（两处，同一个病根 —— 判据的返回值不是清一色 0/1）：
+
+    ① 原判据写死 `值 != 1.0 → 不算伪命中`。物理题有一批 check 直接返回**加权值**
+       （物理01 `both_approx_usable`=0.2308、物理04 `tau_step`=0.4286、物理05
+       `core_hit`=0.7692），还有按比例给分的（物理10 `observed_peak_indexing`=0.909）。
+       这些 check 永远进不了统计，「含整数档无新伪命中」这个条件在物理题上是被架空的。
+    ② 改成「实得值变大即伪命中」后又暴露出反向的错判：`numeric_anchor_hit_rate`
+       是**零权重诊断字段**（不进总分）、`assign_swapped`/`hit_*` 是**扣分项**
+       （命中反而降分）。它们在含整数档下变大不会抬高地板，按 check 记账却会让
+       物理01/物理05 无谓地退回保守档。而各题的权重表并不统一可取（20 题里只有
+       物理08/09/10 有独立的 `weights` 字典，其余题把权重直接烘进 check 的返回值），
+       所以没法靠读权重区分。
+
+    最终判据：**以该 run 的总分为准** —— 含整数档的 `auto_final_answer_score`
+    比仅小数档高，才算这一档独有地抬高了地板。零权重诊断项与扣分项因此自动出局。
+    代价是「一个 check 被点亮、同时另一个被压掉，净额不升」这种被掩盖的伪命中不再
+    驱动定档；它们改为单独告警（下面的 masked），由人工判断是否要手工退档。
     """
     real = collections.defaultdict(list)
     f_dec = collections.defaultdict(list)
     f_int = collections.defaultdict(list)
     new_fp = collections.Counter()
+    masked = collections.defaultdict(collections.Counter)
 
     for case in cases:
         tid = case["task"]
@@ -175,30 +194,69 @@ def _mixed_report(cases, tasks, args) -> int:
         d_dec = grade(perturb_scramble(case["answer"], flip_sign=args.flip_sign))
         d_int = grade(perturb_scramble(case["answer"], flip_sign=args.flip_sign,
                                        integers=True))
+        s_dec = float(d_dec.get("auto_final_answer_score") or 0)
+        s_int = float(d_int.get("auto_final_answer_score") or 0)
         real[tid].append(float(d_real.get("auto_final_answer_score") or 0))
-        f_dec[tid].append(float(d_dec.get("auto_final_answer_score") or 0))
-        f_int[tid].append(float(d_int.get("auto_final_answer_score") or 0))
+        f_dec[tid].append(s_dec)
+        f_int[tid].append(s_int)
 
-        for k, v in d_int.items():
-            if k.startswith("_") or k == "auto_final_answer_score":
-                continue
-            if not isinstance(v, (int, float, bool)):
-                continue
-            # 新伪命中有两种，都要算：
-            #   (a) 真实答复本来拿着这一项，含整数档压不掉而仅小数档压掉了 —— 白拿；
-            #   (b) 真实答复**本来就没拿**这一项，含整数档反而把它点亮 —— 凭空造分，
-            #       比 (a) 更坏。0813 化学15：某答复写的括号内小计 48.338 被 ×2.0 扰动成
-            #       96.676，正好是标准解的 q_NO,ex，`no_joint_partition_function`
-            #       在答案全错时被点亮 0.16。漏掉 (b) 会让该题误采含整数档地板。
-            if float(v) != 1.0 or float(d_dec.get(k) or 0) == 1.0:
-                continue
+        # 新伪命中有两种，都要算：
+        #   (a) 真实答复本来拿着这一项，含整数档压不掉而仅小数档压掉了 —— 白拿；
+        #   (b) 真实答复**本来就没拿**这一项，含整数档反而把它点亮 —— 凭空造分，
+        #       比 (a) 更坏。0813 化学15：某答复写的括号内小计 48.338 被 ×2.0 扰动成
+        #       96.676，正好是标准解的 q_NO,ex，`no_joint_partition_function`
+        #       在答案全错时被点亮 0.16。漏掉 (b) 会让该题误采含整数档地板。
+        # 两种都体现为该 run 的总分在含整数档更高，故只需比总分（见 docstring）。
+        gained = [k for k, v in d_int.items()
+                  if not k.startswith("_") and k != "auto_final_answer_score"
+                  and isinstance(v, (int, float, bool))
+                  and float(v) > float(d_dec.get(k) or 0)]
+        if s_int > s_dec + 1e-9:
             new_fp[tid] += 1
+        elif gained:
+            for k in gained:
+                masked[tid][k] += 1
 
     if not real:
         print("无可审计的 run。")
         return 1
 
-    print("混合档假阳性地板（按题定档：含整数档无新伪命中则采用之）\n")
+    print("混合档假阳性地板（按题定档：含整数档不抬高总分则采用之）\n")
+    print(f"{'题目':<14}{'真实分':>8}{'仅小数':>8}{'含整数':>8}{'定档':>8}{'采用地板':>9}  区分度")
+    print("-" * 66)
+    tot_r = tot_c = tot_d = tot_i = 0.0
+    rows = []
+    for tid in real:
+        r = sum(real[tid]) / len(real[tid])
+        d = sum(f_dec[tid]) / len(f_dec[tid])
+        i = sum(f_int[tid]) / len(f_int[tid])
+        use_int = new_fp[tid] == 0
+        rows.append((tid, r, d, i, use_int, i if use_int else d))
+    for tid, r, d, i, use_int, chosen in sorted(rows, key=lambda x: -x[5]):
+        tot_r += r
+        tot_c += chosen
+        tot_d += d
+        tot_i += i
+        bar = "█" * int((r - chosen) * 20)
+        print(f"{tid:<14}{r:>8.3f}{d:>8.3f}{i:>8.3f}"
+              f"{'含整数' if use_int else '仅小数':>8}{chosen:>9.3f}  {bar}")
+    n = len(rows)
+    print("-" * 66)
+    print(f"{'合计':<14}{tot_r / n:>8.3f}{tot_d / n:>8.3f}{tot_i / n:>8.3f}"
+          f"{'混合':>8}{tot_c / n:>9.3f}")
+    print(f"\n地板占比：仅小数 {tot_d / tot_r:.0%} ／ 含整数 {tot_i / tot_r:.0%} ／ "
+          f"**混合 {tot_c / tot_r:.0%}**")
+    print(f"真正区分答案对错的分 {(tot_r - tot_c) / n:.4f}／满分 1.0")
+    print(f"退回仅小数档的题：{', '.join(t for t, *_ , u, _c in rows if not u) or '（无）'}")
+    if masked:
+        print("\n⚠️ 被掩盖的 check 级伪命中（含整数档点亮了它，但该 run 总分没抬高，"
+              "故不驱动定档）：")
+        for tid in sorted(masked):
+            for k, c in masked[tid].most_common():
+                print(f"   {c}x  {tid}::{k}")
+        print("   零权重诊断项（numeric_anchor_hit_rate）与扣分项（hit_* / *_swapped）"
+              "出现在这里是正常的，它们本就不进总分或反向进总分。")
+    return 0
     print(f"{'题目':<14}{'真实分':>8}{'仅小数':>8}{'含整数':>8}{'定档':>8}{'采用地板':>9}  区分度")
     print("-" * 66)
     tot_r = tot_c = tot_d = tot_i = 0.0
@@ -278,7 +336,10 @@ def _per_check_report(cases, tasks, args) -> int:
                     hit, was = float(v), float(d_real.get(k) or 0)
                 else:
                     continue
-                if hit == 1.0 and was == 1.0:
+                # 见 _mixed_report 里同一处的 0903 注释：带权重值的 check 不满足
+                # `== 1.0`，原判据把它们整批漏掉。「白拿」的正确定义是
+                # **答案作废后这一项的实得值没掉**，与该值是 1.0 还是 0.2308 无关。
+                if was > 0 and hit >= was:
                     bucket[f"{tid}::{k}"] += 1
 
     if not real:
@@ -364,6 +425,7 @@ def main() -> int:
 
     per = collections.defaultdict(lambda: {"real": [], "floor": []})
     free_checks = collections.Counter()
+    free_value = collections.Counter()
     skipped = set()
 
     for case in cases:
@@ -398,8 +460,11 @@ def main() -> int:
                 v_f, v_r = float(v), float(d_real.get(k) or 0)
             else:
                 continue
-            if v_f == 1.0 and v_r == 1.0:
+            # 见 _mixed_report 的 0903 注释：`== 1.0` 会漏掉全部带权重值的 check
+            # （物理01/04/05/10 各有一项），`--verbose` 因此对这些项永远沉默。
+            if v_r > 0 and v_f >= v_r:
                 free_checks[f"{tid}::{k}"] += 1
+                free_value[f"{tid}::{k}"] += v_f
 
     if not per:
         print("无可审计的 run。")
@@ -425,8 +490,9 @@ def main() -> int:
 
     if args.verbose:
         print("\n数值全错后仍然给分的 check 项（白拿项，按次数）：")
+        print("  次数  平均实得   题目::判据")
         for k, v in free_checks.most_common(40):
-            print(f"  {v}x  {k}")
+            print(f"  {v:>3}x  {free_value[k] / v:>8.4f}   {k}")
     return 0
 
 
