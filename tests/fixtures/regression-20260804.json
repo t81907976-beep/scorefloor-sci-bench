@@ -3,7 +3,7 @@
   "model": "被测模型 A",
   "date": "2026-08-04",
   "runs": 100,
-  "note": "判分回归集。expected_score = 判分器当前应产出的分；manual_corrected 非 None 者为人工复核的权威值，两者必须相等。\n判分口径此后经过多轮收紧（删存在性白拿项、量纲门贴数值、反向陷阱改扣分），被调整过的 run 保留原始人工值于 manual_corrected_0804，并在 monotonic_exempt_reason 里写明逐 run 理由 —— 「自动分低于当日人工值」这条单调闸门只对这些 run 豁免。\n有意改动判分逻辑后用 scripts/refresh_regression.py 刷新 expected_score；manual_corrected / original_auto / true_error_task 三个权威字段只能人工修。",
+  "note": "判分回归集。expected_score = 判分器当前应产出的分；manual_corrected 非 None 者为人工复核的权威值，两者必须相等。\n判分口径此后经过多轮收紧（删存在性白拿项、量纲门贴数值、反向陷阱改扣分），被调整过的 run 保留原始人工值于 manual_corrected_0804，并在 monotonic_exempt_reason 里写明逐 run 理由 —— 「自动分低于当日人工值」这条单调闸门只对这些 run 豁免。\n有意改动判分逻辑后用 scripts/refresh_regression.py 刷新 expected_score；manual_corrected / original_auto / true_error_task 三个权威字段只能人工修。\n⚠️ 0903：物理01/02/03/05/06/08 的**题面**已改（删掉七处「结论格式行印出正确选项措辞」，并修了物理08 参考解第 49 行的 Γ 函数代换）。本文件里的 100 份答复是 0804 在**旧题面**下跑出来的，作为**判分器**回归集完全有效（grade() 只读答复文本，改题面前后逐 check 比对100/100 完全一致），但**不能再用来讨论模型在新题面下的行为**；下一次全量跑测的答复与这批不可直接对比。",
   "cases": [
     {
       "task": "test-化学01",
