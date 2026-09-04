@@ -12,7 +12,7 @@ mD=3.3435837724×10^-27 kg，me=9.1093837015×10^-31 kg，ε0=8.8541878128×10^-
 条件，求自洽 dEy/dt、极化电流密度 jp，以及 t=10.0 μs 时 D+ 和电子的极化漂移速度。
 
 请完整写出判据、推理与计算过程。最后单独用一行给出结论，格式为：
-【结果】导引中心近似: 可用/不可用；准中性近似: 可用/不可用；dEy/dt=…；jp=…；vp,i(D+)=…；vp,e(电子)=…
+【结果】导引中心近似: …；准中性近似: …；dEy/dt=…；jp=…；vp,i(D+)=…；vp,e(电子)=…
 
 # SFT标准-response
 
@@ -154,8 +154,32 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     vpe_hit = any(_mag_ok(v, 0.174, 0.30) for v in vpe_vals)
     vpe_wrong_order = any(abs(v) > 10.0 for v in vpe_vals)
 
-    gc_usable = bool(re.search(r'(导引中心|导心|guiding[\s-]?center)[^\n。；;]{0,30}(可用|成立|适用|满足|有效)', full_l))
-    qn_usable = bool(re.search(r'(准中性|quasi[\s-]?neutral)[^\n。；;]{0,30}(可用|成立|适用|满足|有效)', full_l))
+    # 近似可用性裁决：结论词本身不许被否定。
+    # ⚠️ 0903 修：原判据是 `(导引中心|导心)[^\n。；;]{0,30}(可用|成立|适用|满足|有效)`，
+    # 而 **`不可用` 里含 `可用`** —— 隔离验证（把 5 份答复的 可用/成立/适用/满足/有效 原地
+    # 插一个 `不`，其余一字不动）显示 5/5 维持 0.2308 满档：说反话与说对话同分，
+    # 本项 0.2308 的结论词部分对最现实的错法完全免疫（数值锚那一半由数值探针覆盖，
+    # 与此无关）。这是 scripts/audit_label_swap.py docstring 里第 5 条记的病。
+    # 修法照物理09 `final_instability_direction`：在裁决词前加否定前查。
+    # **不**加「全文出现『不可用』就一律不给分」这种反向闸 —— 题面第 15 行的结论格式行
+    # 原样印着「导引中心近似: 可用/不可用」，照抄格式行的答复两个词都有，反向闸会把
+    # 结论其实写对的答复判 0（新增假阴性）。这里只要求：存在**至少一个没被否定的**裁决词。
+    _VERDICT = r'可用|成立|适用|满足|有效'
+    _NEG_BEFORE = r'(?:不|未|难以|无法|不能|不再|并非|没有)'
+
+    def _verdict_positive(label):
+        """label 后 34 字（不跨句）内是否有**未被否定**的可用性裁决。"""
+        for m in re.finditer(label, full_l):
+            win = re.split(r'[\n。；;]', full_l[m.end():m.end() + 34])[0]
+            for v in re.finditer(_VERDICT, win):
+                pre = win[max(0, v.start() - 3):v.start()]
+                if re.search(_NEG_BEFORE + r'[^\n]{0,2}$', pre):
+                    continue          # 「不可用」「未能成立」「无法适用」——说反话
+                return True
+        return False
+
+    gc_usable = _verdict_positive(r'导引中心|导心|guiding[\s-]?center')
+    qn_usable = _verdict_positive(r'准中性|quasi[\s-]?neutral')
     both_usable = gc_usable and qn_usable
     # 「量级判据」加数值同现闸门（按化学题白拿口径收紧）。
     # 原判据是纯关键词：全文出现「回旋半径」「德拜」二字、或 ρi / λDe 符号就算命中，

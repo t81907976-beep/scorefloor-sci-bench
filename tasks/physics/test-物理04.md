@@ -198,8 +198,28 @@ def grade(transcript: list, workspace_path: str, meta: dict) -> dict:
     a_ind_vals = _nums(IND + r'[^0-9\n]{0,40}?[:=≈约]', full_l, 60)
     ratio_ok = _hit(ratio_vals, 5.1e-6, 0.15)
     a_ind_ok = _hit(a_ind_vals, 1.5e-7, 0.15)
-    e1_negligible = bool(re.search(r'(可忽略|忽略|negligible|ppm)', region_l)) \
-        or bool(re.search(r'(诱导\s*e1|induced\s*e1|杂散场)[^\n]{0,60}(可忽略|忽略|negligible)', full_l))
+    # 「可否忽略」是二值裁决，两处收紧（0903）：
+    #   ① 裸 `ppm` 支删除 —— 那是**量级词不是裁决词**，答复里凡写「约几个 ppm」就命中，
+    #      与「诱不诱导得忽略」无关；
+    #   ② 裁决词前加否定前查 —— `不可忽略` 里含 `可忽略`，隔离验证（`可忽略`→`不可忽略`，
+    #      其余一字不动）显示 5/5 维持 0.2857 满档，说反话与说对话同分。
+    # 写法照物理09 `final_instability_direction` 的否定否决闸。
+    _NEG_BEFORE = r'(?:不|未|难以|无法|不能|不再|并非|没有)'
+
+    def _says_negligible(seg):
+        """seg 里是否有**未被否定**的「可忽略」裁决。"""
+        for m in re.finditer(r'忽略|negligible', seg):
+            pre = seg[max(0, m.start() - 4):m.start()]
+            if re.search(_NEG_BEFORE + r'(?:可|能|容|得|以)?\s*$', pre):
+                continue
+            if re.search(r'not\s+$', pre):
+                continue
+            return True
+        return False
+
+    e1_negligible = _says_negligible(region_l) or any(
+        _says_negligible(m.group(0))
+        for m in re.finditer(r'(?:诱导\s*e1|induced\s*e1|杂散场)[^\n]{0,60}', full_l))
     if e1_negligible and ratio_ok and a_ind_ok:
         e1_frac = 1.0
     elif e1_negligible and (ratio_ok or a_ind_ok):
